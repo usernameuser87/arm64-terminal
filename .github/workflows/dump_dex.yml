@@ -31,8 +31,7 @@ jobs:
           xz -d -f /tmp/frida.xz
           adb -s localhost:5555 push /tmp/frida /data/local/tmp/frida-server
           adb -s localhost:5555 shell "chmod 755 /data/local/tmp/frida-server"
-          adb -s localhost:5555 shell "/data/local/tmp/frida-server >/dev/null 2>&1 &"
-          sleep 3
+          adb -s localhost:5555 logcat -c || true
 
           # Launch App & Dump Memory
           mkdir -p ~/dumped_dex
@@ -41,6 +40,12 @@ jobs:
           adb -s localhost:5555 shell pm path com.indomaret.klikindomaret || true
           adb -s localhost:5555 shell am start -n com.indomaret.klikindomaret/.ngsCexmFBytBw || true
           sleep 10
+          echo "PID sebelum frida-server:"
+          adb -s localhost:5555 shell pidof com.indomaret.klikindomaret || true
+          adb -s localhost:5555 logcat -d | grep -iE 'indomaret|AndroidRuntime|FATAL|ProtectedApp|dexprotector|liapp' | tail -n 60 || true
+          adb -s localhost:5555 shell "/data/local/tmp/frida-server >/dev/null 2>&1 &"
+          sleep 3
+          echo "PID sesudah frida-server:"
           adb -s localhost:5555 shell pidof com.indomaret.klikindomaret || true
           ~/venv/bin/frida-dexdump -U -n com.indomaret.klikindomaret --sleep 5 || true
           ls -lh ~/dumped_dex
