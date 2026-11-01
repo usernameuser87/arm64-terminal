@@ -65,7 +65,7 @@ jobs:
           seen_md5 = set()
           dump_count = 0
 
-          def find_target_pid():
+          def get_target_pid():
               try:
                   out = subprocess.check_output(["sudo", "docker", "top", "redroid"], text=True)
                   for line in out.splitlines():
@@ -76,22 +76,32 @@ jobs:
                   pass
               return None
 
-          print("[*] Launching app via adb...")
+          print("[*] Launching app via adb am start...")
           subprocess.run(["adb", "-s", "localhost:5555", "shell", "am", "start", "-n", "com.indomaret.klikindomaret/.ngsCexmFBytBw"])
 
           target_pid = None
-          for _ in range(80):
-              target_pid = find_target_pid()
-              if target_pid:
+          for attempt in range(100):
+              p = get_target_pid()
+              if p:
+                  target_pid = p
                   break
-              time.sleep(0.05)
+              time.sleep(0.04)
 
           if not target_pid:
-              print("[-] Could not find host PID for target!")
+              print("[-] First attempt missed PID, retrying launch...")
+              subprocess.run(["adb", "-s", "localhost:5555", "shell", "am", "start", "-n", "com.indomaret.klikindomaret/.ngsCexmFBytBw"])
+              for _ in range(80):
+                  p = get_target_pid()
+                  if p:
+                      target_pid = p
+                      break
+                  time.sleep(0.04)
+
+          if not target_pid:
+              print("[-] Process PID not found!")
               sys.exit(0)
 
           print(f"[🔥 TARGET DETECTED] Host PID: {target_pid}")
-          # Immediately pause the process with SIGSTOP from the host so it CANNOT exit or crash
           subprocess.run(["sudo", "kill", "-STOP", str(target_pid)])
           print(f"[❄️ FROZEN] Target host PID {target_pid} frozen in RAM via SIGSTOP!")
 
@@ -146,7 +156,6 @@ jobs:
                               pass
               mem.close()
 
-          # Resume process cleanly
           subprocess.run(["sudo", "kill", "-CONT", str(target_pid)])
           print(f"[✔] Total unique decrypted DEX files dumped: {len(seen_md5)}")
           PYEOF
@@ -154,21 +163,27 @@ jobs:
           sudo python3 /tmp/host_dumper.py
 
           mkdir -p $GITHUB_WORKSPACE/dumped_dex
-          cp /tmp/dumped_dex/*.dex $GITHUB_WORKSPACE/dumped_dex/ || true
-          cd $GITHUB_WORKSPACE/dumped_dex
-          zip -r /tmp/all_decrypted_dex.zip *.dex
+          if compgen -G "/tmp/dumped_dex/*.dex" > /dev/null; then
+            cp /tmp/dumped_dex/*.dex $GITHUB_WORKSPACE/dumped_dex/
+            cd $GITHUB_WORKSPACE/dumped_dex
+            zip -j /tmp/all_decrypted_dex.zip *.dex || true
+          fi
 
           echo "=== DAFTAR FILE DUMPED DEX DI RUNNER ==="
           ls -lh $GITHUB_WORKSPACE/dumped_dex/
 
       - name: Upload Dumped DEX to Artifacts
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: klikindomaret-decrypted-dex
           path: ${{ github.workspace }}/dumped_dex/
 
       - name: Release Decrypted DEX Archive
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload apk-v1 /tmp/all_decrypted_dex.zip --repo ${{ github.repository }} --clobber || true
+          if [ -f /tmp/all_decrypted_dex.zip ]; then
+            gh release upload apk-v1 /tmp/all_decrypted_dex.zip --repo ${{ github.repository }} --clobber || true
+          fi
