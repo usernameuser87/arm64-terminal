@@ -27,10 +27,14 @@ jobs:
             echo "Waiting for Android boot_completed... ($i/40)"
             sleep 2
           done
+          
+          # Restart adbd as root cleanly
           adb -s localhost:5555 root || true
-          sleep 2
+          sleep 4
+          adb disconnect localhost:5555 || true
           adb connect localhost:5555 || true
-          adb -s localhost:5555 shell "id"
+          adb -s localhost:5555 wait-for-device || true
+          adb -s localhost:5555 shell "id" || true
           adb devices
 
       - name: Download & Install Untouched Signed APK
@@ -50,9 +54,6 @@ jobs:
 
       - name: Setup Root Frida Server & Dump DEX
         run: |
-          adb connect localhost:5555 || true
-          adb -s localhost:5555 root || true
-          sleep 2
           adb connect localhost:5555 || true
 
           python3 -m venv ~/venv
