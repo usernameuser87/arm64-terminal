@@ -37,7 +37,10 @@ jobs:
           # Launch App & Dump Memory
           mkdir -p ~/dumped_dex
           cd ~/dumped_dex
-          ~/venv/bin/frida-dexdump -U -f com.indomaret.klikindomaret --sleep 5 || true
+          adb -s localhost:5555 shell monkey -p com.indomaret.klikindomaret -c android.intent.category.LAUNCHER 1
+          sleep 10
+          adb -s localhost:5555 shell pidof com.indomaret.klikindomaret || true
+          ~/venv/bin/frida-dexdump -U -n com.indomaret.klikindomaret --sleep 5 || true
           ls -lh ~/dumped_dex
 
       - name: Upload Dumped DEX to Artifacts
