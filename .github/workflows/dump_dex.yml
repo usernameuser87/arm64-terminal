@@ -87,7 +87,7 @@ jobs:
           echo "Forwarded JDWP port 8100 to PID $PID"
 
           cat << 'EOF' > /tmp/wait_dumper.py
-          import frida, time, os, sys, hashlib, subprocess
+          import frida, time, os, sys, hashlib, subprocess, threading
 
           pid = int(sys.argv[1])
           device = frida.get_usb_device()
@@ -98,11 +98,17 @@ jobs:
           os.makedirs(out_dir, exist_ok=True)
           seen_md5 = set()
           dump_count = 0
+          hook_ready = threading.Event()
 
           def on_message(message, data):
               global dump_count
-              if message.get('type') == 'send' and message.get('payload', {}).get('type') == 'dex_opened':
-                  if data:
+              if message.get('type') == 'send':
+                  payload = message.get('payload', {})
+                  p_type = payload.get('type') if isinstance(payload, dict) else payload
+                  if p_type == 'hook_ready':
+                      print("[🔥] Java hook ready confirmation received from process!")
+                      hook_ready.set()
+                  elif p_type == 'dex_opened' and data:
                       m = hashlib.md5(data).hexdigest()
                       if m not in seen_md5:
                           seen_md5.add(m)
@@ -110,7 +116,7 @@ jobs:
                           fpath = os.path.join(out_dir, f"opencommon_{dump_count:02d}_{m[:8]}.dex")
                           with open(fpath, "wb") as f:
                               f.write(data)
-                          print(f"[🔥 INTERCEPTED DEX] Saved to {fpath} ({len(data)/1024/1024:.2f} MB)")
+                          print(f"[🔥 INTERCEPTED DEX] Saved: {fpath} ({len(data)/1024/1024:.2f} MB)")
 
           js_code = """
           rpc.exports = {
@@ -134,20 +140,7 @@ jobs:
               }
           };
 
-          Java.perform(function() {
-              console.log("[*] Injected into paused process!");
-              try {
-                  var ProtectedApp = Java.use("edts.klikidm.android.ProtectedApp");
-                  ProtectedApp.b.implementation = function() {
-                      console.log("[🔥] BYPASSED ProtectedApp.b() Certificate Check successfully!");
-                      return;
-                  };
-              } catch(e) {
-                  console.log("[-] Error hooking ProtectedApp.b: " + e);
-              }
-          });
-
-          // Hook libart DexFile::OpenCommon to intercept ANY decrypted DEX
+          // Hook libart DexFile::OpenCommon first
           var artModule = Process.findModuleByName("libart.so");
           if (artModule) {
               artModule.enumerateExports().forEach(function(exp) {
@@ -170,17 +163,36 @@ jobs:
                   }
               });
           }
+
+          Java.perform(function() {
+              console.log("[*] In Java thread, installing ProtectedApp.b bypass...");
+              try {
+                  var ProtectedApp = Java.use("edts.klikidm.android.ProtectedApp");
+                  ProtectedApp.b.implementation = function() {
+                      console.log("[🔥] BYPASSED ProtectedApp.b() Certificate Check successfully!");
+                      return;
+                  };
+                  console.log("[+] Hook installed on ProtectedApp.b!");
+              } catch(e) {
+                  console.log("[-] Error hooking ProtectedApp.b: " + e);
+              }
+              send({ type: "hook_ready" });
+          });
           """
 
           script = session.create_script(js_code)
           script.on('message', on_message)
           script.load()
-          print("[*] Hook loaded in memory!")
 
-          # Resume process using jdb attach command
-          print("[*] Resuming paused process via jdb...")
+          print("[*] Waiting for Java hook to be confirmed active...")
+          if hook_ready.wait(timeout=8):
+              print("[+] Hook confirmed! Now releasing JDWP debugger...")
+          else:
+              print("[!] Hook timeout warning, attempting resume anyway...")
+
+          # Resume process via jdb
           subprocess.run(["jdb", "-attach", "localhost:8100"], input=b"exit\n", capture_output=True)
-          print("[+] JDB resume signal sent!")
+          print("[+] JDB resume signal sent! App is executing.")
 
           print("[*] Waiting 15s for DexProtector to decrypt assets.dat into RAM...")
           time.sleep(15)
