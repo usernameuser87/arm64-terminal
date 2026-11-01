@@ -15,7 +15,7 @@ session = device.attach(pid)
 
 js_code = """
 function initHarvester() {
-    if (!Java.available) {
+    if (typeof Java === 'undefined' || !Java.available) {
         setTimeout(initHarvester, 50);
         return;
     }
