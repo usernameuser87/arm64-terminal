@@ -57,7 +57,7 @@ jobs:
           adb connect localhost:5555 || true
 
           python3 -m venv ~/venv
-          ~/venv/bin/pip install frida frida-tools
+          ~/venv/bin/pip install frida frida-tools frida-dexdump
 
           # Setup Frida Server di Android
           curl -sL https://github.com/frida/frida/releases/download/17.25.0/frida-server-17.25.0-android-arm64.xz -o /tmp/frida.xz
@@ -99,42 +99,20 @@ jobs:
                       print(f"[*] {payload}")
 
           js_code = """
-          // 1. Neutralize process termination
+          // 1. Intercept abort & exit
           ['exit', '_exit', 'abort'].forEach(function(sym) {
               var p = Module.findExportByName("libc.so", sym);
               if (p) {
                   Interceptor.attach(p, {
                       onEnter: function() {
-                          console.log("[🛡️] Prevented " + sym + " from killing process!");
-                          Thread.sleep(30);
+                          console.log("[🛡️] Blocked " + sym + " from killing process!");
+                          Thread.sleep(60);
                       }
                   });
               }
           });
 
-          // 2. Spoof system properties to defeat emulator detection
-          var sysPropGet = Module.findExportByName("libc.so", "__system_property_get");
-          if (sysPropGet) {
-              Interceptor.attach(sysPropGet, {
-                  onEnter: function(args) {
-                      this.name = args[0].readCString();
-                      this.valPtr = args[1];
-                  },
-                  onLeave: function(retval) {
-                      if (this.name) {
-                          if (this.name === "ro.kernel.qemu" || this.name === "qemu") {
-                              this.valPtr.writeUtf8String("0");
-                              retval.replace(ptr(1));
-                          } else if (this.name.indexOf("redroid") !== -1 || this.name.indexOf("goldfish") !== -1) {
-                              this.valPtr.writeUtf8String("samsung");
-                              retval.replace(ptr(7));
-                          }
-                      }
-                  }
-              });
-          }
-
-          // 3. Hook Art DexFile::OpenCommon
+          // 2. Hook Art DexFile::OpenCommon
           var artModule = Process.findModuleByName("libart.so");
           if (artModule) {
               artModule.enumerateExports().forEach(function(exp) {
@@ -191,8 +169,8 @@ jobs:
           print("[*] Resuming target process...")
           device.resume(pid)
 
-          # Active sweep loop every 500ms for 12 seconds
-          for tick in range(24):
+          # Active sweep loop every 500ms for 16 seconds
+          for tick in range(32):
               time.sleep(0.5)
               try:
                   ranges = script.exports_sync.scandex()
