@@ -27,7 +27,7 @@ jobs:
           ~/venv/bin/pip install frida frida-tools frida-dexdump
 
           # Setup Frida Server
-          curl -sL https://github.com/frida/frida/releases/download/16.5.9/frida-server-16.5.9-android-arm64.xz -o /tmp/frida.xz
+          curl -sL https://github.com/frida/frida/releases/download/17.25.0/frida-server-17.25.0-android-arm64.xz -o /tmp/frida.xz
           xz -d -f /tmp/frida.xz
           adb -s localhost:5555 push /tmp/frida /data/local/tmp/frida-server
           adb -s localhost:5555 shell "chmod 755 /data/local/tmp/frida-server"
