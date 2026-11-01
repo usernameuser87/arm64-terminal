@@ -16,13 +16,15 @@ jobs:
           echo "=== 2. RUN REDROID ANDROID 11 ==="
           sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest
           
-          echo "=== 3. WAIT FOR ANDROID ADB READY ==="
-          for i in {1..35}; do
+          echo "=== 3. WAIT FOR ANDROID BOOT COMPLETED ==="
+          for i in {1..40}; do
             adb connect localhost:5555 || true
-            if adb devices | grep -q "localhost:5555.*device$"; then
-              echo "Redroid SIAP!"
+            BOOT=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            if [ "$BOOT" = "1" ]; then
+              echo "Android system fully booted and package manager ready!"
               break
             fi
+            echo "Waiting for Android boot_completed... ($i/40)"
             sleep 2
           done
           adb devices
@@ -32,7 +34,14 @@ jobs:
           adb connect localhost:5555 || true
           wget -q -O /tmp/klikindo.apk https://github.com/usernameuser87/arm64-terminal/releases/download/apk-v1/klikindomaret_patched.apk
           ls -lh /tmp/klikindo.apk
-          adb -s localhost:5555 install -r /tmp/klikindo.apk
+          for attempt in {1..5}; do
+            if adb -s localhost:5555 install -r /tmp/klikindo.apk; then
+              echo "APK installed successfully!"
+              break
+            fi
+            echo "Install failed, retrying in 3s... ($attempt/5)"
+            sleep 3
+          done
           adb -s localhost:5555 shell pm list packages | grep indomaret
 
       - name: Setup Frida Server & Dump DEX
