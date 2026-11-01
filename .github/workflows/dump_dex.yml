@@ -7,20 +7,14 @@ jobs:
   dump:
     runs-on: ubuntu-24.04-arm
     steps:
-      - name: Setup Kernel & Redroid Android (Spoofed Hardware)
+      - name: Setup Kernel & Redroid Android
         run: |
           echo "=== 1. PREPARE KERNEL & PACKAGES ==="
           sudo modprobe binder_linux
           sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils wget
           
-          echo "=== 2. RUN REDROID WITHOUT QEMU FLAG ==="
-          sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest \
-            ro.product.model=Pixel_6 \
-            ro.product.brand=google \
-            ro.product.manufacturer=Google \
-            ro.hardware=qcom \
-            androidboot.hardware=qcom \
-            qemu=0
+          echo "=== 2. RUN REDROID ANDROID 11 ==="
+          sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest
           
           echo "=== 3. WAIT FOR ANDROID ADB READY ==="
           for i in {1..35}; do
@@ -66,18 +60,7 @@ jobs:
           print("[*] Memasang hook OpenCommon & Memory Scanner...")
 
           js_code = """
-          Java.perform(function() {
-              console.log("[*] Java context active!");
-              try {
-                  var ProtectedApp = Java.use("edts.klikidm.android.ProtectedApp");
-                  ProtectedApp.b.implementation = function() {
-                      console.log("[🔥] BYPASS: Certificate Check bypassed!");
-                      return;
-                  };
-              } catch(e) {}
-          });
-
-          // Hook libart DexFile::OpenCommon to intercept ANY decrypted DEX before crash
+          // Hook libart DexFile::OpenCommon to intercept ANY decrypted DEX before any possible crash
           var artModule = Process.findModuleByName("libart.so");
           if (artModule) {
               artModule.enumerateExports().forEach(function(exp) {
@@ -141,7 +124,7 @@ jobs:
                               f.write(data)
                           print(f"[🔥 INTERCEPTED DEX] Saved to {fpath} ({len(data)/1024/1024:.2f} MB)")
 
-          # Meluncurkan aplikasi Klik Indomaret via Frida
+          # Meluncurkan aplikasi Klik Indomaret via Frida spawn
           try:
               pid = device.spawn(["com.indomaret.klikindomaret"])
               session = device.attach(pid)
