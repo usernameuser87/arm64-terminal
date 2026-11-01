@@ -37,7 +37,7 @@ jobs:
           adb -s localhost:5555 shell "id" || true
           adb devices
 
-      - name: Download & Install APK
+      - name: Download & Install Untouched Signed APK
         run: |
           adb connect localhost:5555 || true
           wget -q -O /tmp/klikindo.apk https://github.com/usernameuser87/arm64-terminal/releases/download/apk-v1/klikindomaret_signed.apk
