@@ -48,7 +48,7 @@ jobs:
         run: |
           adb connect localhost:5555 || true
           python3 -m venv ~/venv
-          ~/venv/bin/pip install frida frida-tools
+          ~/venv/bin/pip install frida frida-tools frida-dexdump
 
           # Setup Frida Server di Android
           curl -sL https://github.com/frida/frida/releases/download/17.25.0/frida-server-17.25.0-android-arm64.xz -o /tmp/frida.xz
@@ -61,116 +61,19 @@ jobs:
 
           mkdir -p ~/dumped_dex
 
-          # Buat skrip python dumper dengan hook libart.so OpenCommon
-          cat << 'EOF' > /tmp/art_dumper.py
-          import frida, time, os, sys, hashlib
+          echo "[*] Meluncurkan aplikasi Klik Indomaret..."
+          adb -s localhost:5555 shell am start -n com.indomaret.klikindomaret/.ngsCexmFBytBw
+          sleep 12
 
-          device = frida.get_usb_device()
-          print("[*] Memasang hook OpenCommon & Memory Scanner...")
+          echo "[*] Mengecek status proses..."
+          PID=$(adb -s localhost:5555 shell pidof com.indomaret.klikindomaret | tr -d '\r' | awk '{print $1}')
+          echo "Process PID: $PID"
+          adb -s localhost:5555 logcat -d | grep -iE 'indomaret|AndroidRuntime|ProtectedApp' | tail -n 35 || true
 
-          js_code = """
-          // Hook libart DexFile::OpenCommon to intercept ANY decrypted DEX before any possible crash
-          var artModule = Process.findModuleByName("libart.so");
-          if (artModule) {
-              artModule.enumerateExports().forEach(function(exp) {
-                  if (exp.name.indexOf("DexFile") !== -1 && exp.name.indexOf("OpenCommon") !== -1) {
-                      console.log("[+] Hooking Art OpenCommon: " + exp.name);
-                      try {
-                          Interceptor.attach(exp.address, {
-                              onEnter: function(args) {
-                                  var base = args[1];
-                                  var size = args[2].toInt32();
-                                  try {
-                                      var magic = base.readCString(4);
-                                      if (magic === "dex\\n") {
-                                          send({ type: "dex_opened", base: base.toString(), size: size }, base.readByteArray(size));
-                                      }
-                                  } catch(e) {}
-                              }
-                          });
-                      } catch(e) {}
-                  }
-              });
-          }
-
-          rpc.exports = {
-              scandex: function() {
-                  var list = [];
-                  Process.enumerateRanges('r--').forEach(function(m) {
-                      try {
-                          var magic = m.base.readCString(4);
-                          if (magic === "dex\\n") {
-                              var size = m.base.add(0x20).readU32();
-                              if (size > 0x1000 && size < 0x3000000) {
-                                  list.push({ base: m.base.toString(), size: size });
-                              }
-                          }
-                      } catch(e) {}
-                  });
-                  return list;
-              },
-              dumpbytes: function(baseStr, size) {
-                  return ptr(baseStr).readByteArray(size);
-              }
-          };
-          """
-
-          out_dir = os.path.expanduser("~/dumped_dex")
-          os.makedirs(out_dir, exist_ok=True)
-          seen_md5 = set()
-          dump_count = 0
-
-          def on_message(message, data):
-              global dump_count
-              if message.get('type') == 'send' and message.get('payload', {}).get('type') == 'dex_opened':
-                  if data:
-                      m = hashlib.md5(data).hexdigest()
-                      if m not in seen_md5:
-                          seen_md5.add(m)
-                          dump_count += 1
-                          fpath = os.path.join(out_dir, f"opencommon_{dump_count:02d}_{m[:8]}.dex")
-                          with open(fpath, "wb") as f:
-                              f.write(data)
-                          print(f"[🔥 INTERCEPTED DEX] Saved to {fpath} ({len(data)/1024/1024:.2f} MB)")
-
-          # Meluncurkan aplikasi Klik Indomaret via Frida spawn
-          try:
-              pid = device.spawn(["com.indomaret.klikindomaret"])
-              session = device.attach(pid)
-              script = session.create_script(js_code)
-              script.on('message', on_message)
-              script.load()
-              device.resume(pid)
-              print(f"[*] Process spawned (PID {pid}), waiting 15s for execution & decryption...")
-              time.sleep(15)
-
-              # Backup scan via Process.enumerateRanges
-              try:
-                  ranges = script.exports_sync.scandex()
-                  print(f"[*] Memory range scan found {len(ranges)} candidates")
-                  for item in ranges:
-                      data = script.exports_sync.dumpbytes(item['base'], item['size'])
-                      if data:
-                          m = hashlib.md5(data).hexdigest()
-                          if m not in seen_md5:
-                              seen_md5.add(m)
-                              dump_count += 1
-                              fpath = os.path.join(out_dir, f"scanned_{dump_count:02d}_{m[:8]}.dex")
-                              with open(fpath, "wb") as f:
-                                  f.write(data)
-                              print(f"[+] Scanned DEX saved: {fpath} ({item['size']/1024/1024:.2f} MB)")
-              except Exception as e:
-                  print(f"[-] Scan exception: {e}")
-
-              session.detach()
-          except Exception as e:
-              print(f"[-] Frida spawn exception: {e}")
-
-          print(f"[✔] Total file DEX unik tersimpan: {len(seen_md5)}")
-          EOF
-
-          ~/venv/bin/python /tmp/art_dumper.py || true
-          adb -s localhost:5555 logcat -d | grep -iE 'indomaret|AndroidRuntime|ProtectedApp' | tail -n 25 || true
+          if [ -n "$PID" ]; then
+            echo "[*] Aplikasi berjalan! Melakukan memory dump DEX via frida-dexdump..."
+            ~/venv/bin/frida-dexdump -U -p "$PID" -o ~/dumped_dex/ -d || true
+          fi
 
           echo "=== DAFTAR FILE DUMPED DEX ==="
           ls -lh ~/dumped_dex/
