@@ -11,7 +11,7 @@ jobs:
         run: |
           echo "=== 1. PREPARE KERNEL & PACKAGES ==="
           sudo modprobe binder_linux
-          sudo apt-get update && sudo apt-get install -y adb python3 wget
+          sudo apt-get update && sudo apt-get install -y adb python3 wget zip
           
           echo "=== 2. RUN REDROID STANDARD ==="
           sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest
@@ -55,13 +55,13 @@ jobs:
       - name: Host Kernel RAM Dumper (Zero-Intrusion)
         run: |
           adb connect localhost:5555 || true
-          mkdir -p ~/dumped_dex
+          sudo mkdir -p /tmp/dumped_dex
+          sudo chmod 777 /tmp/dumped_dex
 
           cat << 'PYEOF' > /tmp/host_dumper.py
           import sys, os, struct, time, hashlib, subprocess
 
-          out_dir = os.path.expanduser("~/dumped_dex")
-          os.makedirs(out_dir, exist_ok=True)
+          out_dir = "/tmp/dumped_dex"
           seen_md5 = set()
           dump_count = 0
 
@@ -153,12 +153,22 @@ jobs:
 
           sudo python3 /tmp/host_dumper.py
 
-          echo "=== DAFTAR FILE DUMPED DEX DI HOST ==="
-          ls -lh ~/dumped_dex/
+          mkdir -p $GITHUB_WORKSPACE/dumped_dex
+          cp /tmp/dumped_dex/*.dex $GITHUB_WORKSPACE/dumped_dex/ || true
+          cd $GITHUB_WORKSPACE/dumped_dex
+          zip -r /tmp/all_decrypted_dex.zip *.dex
+
+          echo "=== DAFTAR FILE DUMPED DEX DI RUNNER ==="
+          ls -lh $GITHUB_WORKSPACE/dumped_dex/
 
       - name: Upload Dumped DEX to Artifacts
         uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: klikindomaret-dumped-dex
-          path: ~/dumped_dex/
+          name: klikindomaret-decrypted-dex
+          path: ${{ github.workspace }}/dumped_dex/
+
+      - name: Release Decrypted DEX Archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload apk-v1 /tmp/all_decrypted_dex.zip --repo ${{ github.repository }} --clobber || true
