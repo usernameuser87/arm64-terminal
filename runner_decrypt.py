@@ -1,5 +1,13 @@
 import frida, time, sys, os
 
+def on_message(message, data):
+    if message.get('type') == 'send':
+        print(f"[Frida] {message.get('payload')}")
+    elif message.get('type') == 'error':
+        print(f"[Frida Error] {message.get('description')}")
+    else:
+        print(f"[Frida Msg] {message}")
+
 device = frida.get_usb_device()
 print("[*] Spawning com.indomaret.klikindomaret under Frida control...")
 pid = device.spawn(["com.indomaret.klikindomaret"])
@@ -7,24 +15,38 @@ session = device.attach(pid)
 
 js_code = """
 Java.perform(function() {
-    console.log("[*] Injected into process! Waiting for ProtectedApp.c()...");
+    send("Injected into process! Waiting for ProtectedApp.c()...");
 
-    // 1. Hook ProtectedApp.c to decrypt immediately upon library initialization
+    // 1. Prevent abort/exit
+    ['exit', '_exit', 'abort'].forEach(function(sym) {
+        var p = Module.findExportByName("libc.so", sym);
+        if (p) {
+            Interceptor.attach(p, {
+                onEnter: function() {
+                    send("Prevented " + sym + " from killing process!");
+                    Thread.sleep(60);
+                }
+            });
+        }
+    });
+
     var ProtectedApp = Java.use("edts.klikidm.android.ProtectedApp");
     ProtectedApp.c.implementation = function() {
-        console.log("[*] ProtectedApp.c() called! Executing original init...");
+        send("ProtectedApp.c() executing original init...");
         var ret = this.c();
-        console.log("[🔥] ProtectedApp.c() completed! DexProtector is ready. Starting string harvesting...");
+        send("ProtectedApp.c() completed! DexProtector ready. Harvesting strings...");
 
         try {
-            var File = Java.use("java.io.File");
             var BufferedReader = Java.use("java.io.BufferedReader");
             var FileReader = Java.use("java.io.FileReader");
             var BufferedWriter = Java.use("java.io.BufferedWriter");
             var FileWriter = Java.use("java.io.FileWriter");
 
-            var reader = BufferedReader.$new(FileReader.$new("/data/local/tmp/all_enc_strings.txt"));
-            var writer = BufferedWriter.$new(FileWriter.$new("/data/local/tmp/all_decrypted_strings.txt"));
+            var inPath = "/data/data/com.indomaret.klikindomaret/cache/all_enc_strings.txt";
+            var outPath = "/data/data/com.indomaret.klikindomaret/cache/all_decrypted_strings.txt";
+
+            var reader = BufferedReader.$new(FileReader.$new(inPath));
+            var writer = BufferedWriter.$new(FileWriter.$new(outPath));
 
             var line = null;
             var count = 0;
@@ -34,9 +56,12 @@ Java.perform(function() {
                     var name = parts[0];
                     var enc = parts[1];
                     try {
-                        var dec = ProtectedApp.s(enc);
-                        writer.write(name + "=" + dec + "\\n");
+                        var plain = ProtectedApp.s(enc);
+                        writer.write(name + "=" + plain + "\\n");
                         count++;
+                        if (count % 200 === 0) {
+                            send("Decrypted " + count + " strings so far...");
+                        }
                     } catch(e) {
                         writer.write(name + "=[ERR: " + e + "]\\n");
                     }
@@ -45,9 +70,9 @@ Java.perform(function() {
             reader.close();
             writer.flush();
             writer.close();
-            console.log("[✔✔✔] HARVESTED ALL " + count + " DECRYPTED STRINGS DIRECTLY IN RAM!");
+            send("SUCCESS_HARVESTED_" + count + "_STRINGS");
         } catch(err) {
-            console.log("[-] Harvester error: " + err);
+            send("Harvester fatal error: " + err);
         }
 
         return ret;
@@ -56,13 +81,14 @@ Java.perform(function() {
 """
 
 script = session.create_script(js_code)
+script.on('message', on_message)
 script.load()
 
-print("[*] Resuming app...")
+print("[*] Resuming app to let DexProtector initialize...")
 device.resume(pid)
 
-# Wait 8s for harvester to run
-for _ in range(16):
+# Wait up to 25s for harvesting to complete
+for i in range(50):
     time.sleep(0.5)
 
 session.detach()
