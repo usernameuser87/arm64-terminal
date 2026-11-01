@@ -37,7 +37,7 @@ jobs:
           adb -s localhost:5555 shell "id" || true
           adb devices
 
-      - name: Download & Install Untouched Signed APK
+      - name: Download & Install APK
         run: |
           adb connect localhost:5555 || true
           wget -q -O /tmp/klikindo.apk https://github.com/usernameuser87/arm64-terminal/releases/download/apk-v1/klikindomaret_signed.apk
@@ -57,7 +57,7 @@ jobs:
           adb connect localhost:5555 || true
 
           python3 -m venv ~/venv
-          ~/venv/bin/pip install frida frida-tools
+          ~/venv/bin/pip install frida frida-tools frida-dexdump
 
           # Setup Frida Server di Android
           curl -sL https://github.com/frida/frida/releases/download/17.25.0/frida-server-17.25.0-android-arm64.xz -o /tmp/frida.xz
@@ -70,29 +70,22 @@ jobs:
 
           mkdir -p ~/dumped_dex
 
-          # Set app into waiting-for-debugger mode
-          echo "[*] Setting debug-app waiting mode..."
-          adb -s localhost:5555 shell am set-debug-app -w --persistent com.indomaret.klikindomaret
-
-          # Launch activity (it will pause at start waiting for debugger)
-          echo "[*] Launching paused activity..."
+          # Launch activity
+          echo "[*] Meluncurkan aplikasi Klik Indomaret..."
           adb -s localhost:5555 shell am start -n com.indomaret.klikindomaret/.ngsCexmFBytBw
-          sleep 3
+          sleep 8
 
           # Check PID
           PID=$(adb -s localhost:5555 shell pidof com.indomaret.klikindomaret | tr -d '\r' | awk '{print $1}')
-          echo "Target Paused PID: $PID"
+          echo "Target Running PID: $PID"
+          adb -s localhost:5555 logcat -d | grep -iE 'indomaret|AndroidRuntime|ProtectedApp' | tail -n 35 || true
 
-          # Forward JDWP port
-          adb -s localhost:5555 forward tcp:8100 jdwp:$PID
-          echo "Forwarded JDWP port 8100 to PID $PID"
-
-          cat << 'EOF' > /tmp/wait_dumper.py
-          import frida, time, os, sys, hashlib, socket, struct, threading
+          cat << 'EOF' > /tmp/memory_dumper.py
+          import frida, time, os, sys, hashlib
 
           pid = int(sys.argv[1])
           device = frida.get_usb_device()
-          print(f"[*] Attaching to paused process PID: {pid} as ROOT...")
+          print(f"[*] Attaching to running process PID: {pid} as ROOT...")
           session = device.attach(pid)
 
           out_dir = os.path.expanduser("~/dumped_dex")
@@ -100,82 +93,7 @@ jobs:
           seen_md5 = set()
           dump_count = 0
 
-          def on_message(message, data):
-              global dump_count
-              if message.get('type') == 'send':
-                  payload = message.get('payload', {})
-                  p_type = payload.get('type') if isinstance(payload, dict) else payload
-                  if p_type == 'dex_opened' and data:
-                      m = hashlib.md5(data).hexdigest()
-                      if m not in seen_md5:
-                          seen_md5.add(m)
-                          dump_count += 1
-                          fpath = os.path.join(out_dir, f"opencommon_{dump_count:02d}_{m[:8]}.dex")
-                          with open(fpath, "wb") as f:
-                              f.write(data)
-                          print(f"[🔥 INTERCEPTED DEX] Saved: {fpath} ({len(data)/1024/1024:.2f} MB)")
-
           js_code = """
-          // Expected SHA-256 digest bytes for Indomaret: c3155378c113197a8a06963bb32ba7949cc9aa651b3cce4b23922de7fd05ffbf
-          var targetDigest = [195, 21, 83, 120, 193, 19, 25, 122, 138, 6, 150, 59, 179, 43, 167, 148, 156, 201, 170, 101, 27, 60, 206, 75, 35, 146, 45, 231, 253, 5, 255, 191];
-
-          // 1. Native BoringSSL Hook: Intercept EVP_DigestFinal_ex & EVP_DigestFinal directly in C
-          Process.enumerateModules().forEach(function(m) {
-              if (m.name.indexOf("crypto") !== -1 || m.name.indexOf("ssl") !== -1) {
-                  ["EVP_DigestFinal_ex", "EVP_DigestFinal", "SHA256_Final", "SHA256"].forEach(function(sym) {
-                      var exp = m.findExportByName(sym);
-                      if (exp) {
-                          console.log("[+] Intercepting native " + sym + " in " + m.name);
-                          try {
-                              Interceptor.attach(exp, {
-                                  onEnter: function(args) {
-                                      if (sym === "EVP_DigestFinal_ex" || sym === "EVP_DigestFinal") {
-                                          this.out = args[1];
-                                      } else if (sym === "SHA256_Final") {
-                                          this.out = args[0];
-                                      } else if (sym === "SHA256") {
-                                          this.out = args[2];
-                                      }
-                                  },
-                                  onLeave: function(retval) {
-                                      if (this.out) {
-                                          try {
-                                              this.out.writeByteArray(targetDigest);
-                                              console.log("[🔥] Spoofed authentic SHA256 digest via " + sym + "!");
-                                          } catch(e) {}
-                                      }
-                                  }
-                              });
-                          } catch(e) {}
-                      }
-                  });
-              }
-          });
-
-          // 2. Native Art Hook: Intercept DexFile::OpenCommon to catch decrypted DEX bytes
-          var artModule = Process.findModuleByName("libart.so");
-          if (artModule) {
-              artModule.enumerateExports().forEach(function(exp) {
-                  if (exp.name.indexOf("DexFile") !== -1 && exp.name.indexOf("OpenCommon") !== -1) {
-                      console.log("[+] Intercepting Art OpenCommon: " + exp.name);
-                      try {
-                          Interceptor.attach(exp.address, {
-                              onEnter: function(args) {
-                                  var base = args[1];
-                                  var size = args[2].toInt32();
-                                  try {
-                                      var magic = base.readCString(4);
-                                      if (magic === "dex\\n") {
-                                          send({ type: "dex_opened", base: base.toString(), size: size }, base.readByteArray(size));
-                                      }
-                                  } catch(e) {}
-                              }
-                          });
-                      } catch(e) {}
-                  }
-              });
-          }
-
           rpc.exports = {
               scandex: function() {
                   var list = [];
@@ -199,32 +117,8 @@ jobs:
           """
 
           script = session.create_script(js_code)
-          script.on('message', on_message)
           script.load()
-          print("[*] Native BoringSSL EVP & Art hooks loaded!")
-
-          # Resume process via Python JDWP daemon thread
-          def jdwp_resumer():
-              try:
-                  s = socket.socket()
-                  s.connect(("localhost", 8100))
-                  s.sendall(b"JDWP-Handshake")
-                  resp = s.recv(14)
-                  if resp == b"JDWP-Handshake":
-                      print("[+] JDWP Handshake OK! Sending VM.Resume packet...")
-                      pkt = struct.pack(">IIBBB", 11, 1, 0, 1, 9)
-                      s.sendall(pkt)
-                      print("[+] JDWP Resume sent! Holding connection open for execution...")
-                      time.sleep(25)
-                      s.close()
-              except Exception as e:
-                  print("[-] JDWP error:", e)
-
-          jdwp_thread = threading.Thread(target=jdwp_resumer, daemon=True)
-          jdwp_thread.start()
-
-          print("[*] Waiting 20s for DexProtector to decrypt assets.dat into RAM...")
-          time.sleep(20)
+          print("[*] Memory scanner loaded!")
 
           # Sweep memory ranges
           try:
@@ -249,12 +143,12 @@ jobs:
           EOF
 
           if [ -n "$PID" ]; then
-            ~/venv/bin/python /tmp/wait_dumper.py "$PID" || true
+            ~/venv/bin/python /tmp/memory_dumper.py "$PID" || true
+            ~/venv/bin/frida-dexdump -U -p "$PID" -o ~/dumped_dex/ -d || true
           else
-            echo "[-] PID not found!"
+            echo "[-] PID not found via pidof, trying frida-dexdump via package spawn..."
+            ~/venv/bin/frida-dexdump -U -f com.indomaret.klikindomaret --sleep 8 -o ~/dumped_dex/ -d || true
           fi
-
-          adb -s localhost:5555 logcat -d | grep -iE 'indomaret|AndroidRuntime|ProtectedApp' | tail -n 35 || true
 
           echo "=== DAFTAR FILE DUMPED DEX ==="
           ls -lh ~/dumped_dex/
