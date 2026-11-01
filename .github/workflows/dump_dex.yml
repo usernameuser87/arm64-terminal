@@ -37,7 +37,10 @@ jobs:
           # Launch App & Dump Memory
           mkdir -p ~/dumped_dex
           cd ~/dumped_dex
-          adb -s localhost:5555 shell monkey -p com.indomaret.klikindomaret -c android.intent.category.LAUNCHER 1
+          adb -s localhost:5555 shell monkey -p com.indomaret.klikindomaret -c android.intent.category.LAUNCHER 1 || true
+          sleep 5
+          adb -s localhost:5555 shell pidof com.indomaret.klikindomaret || true
+          adb -s localhost:5555 shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p com.indomaret.klikindomaret || true
           sleep 10
           adb -s localhost:5555 shell pidof com.indomaret.klikindomaret || true
           ~/venv/bin/frida-dexdump -U -n com.indomaret.klikindomaret --sleep 5 || true
