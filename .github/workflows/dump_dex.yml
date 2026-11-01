@@ -77,9 +77,10 @@ jobs:
           cat << 'EOF' > /tmp/wait_dumper.py
           import frida, time, os, sys, hashlib
 
+          target = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else "com.indomaret.klikindomaret"
           device = frida.get_usb_device()
-          print("[*] Attaching to paused process com.indomaret.klikindomaret...")
-          session = device.attach("com.indomaret.klikindomaret")
+          print(f"[*] Attaching to paused process PID: {target}...")
+          session = device.attach(target)
 
           js_code = """
           Java.perform(function() {
@@ -189,7 +190,12 @@ jobs:
           print(f"[✔] Total file DEX unik tersimpan: {len(seen_md5)}")
           EOF
 
-          ~/venv/bin/python /tmp/wait_dumper.py || true
+          if [ -n "$PID" ]; then
+            ~/venv/bin/python /tmp/wait_dumper.py "$PID" || true
+          else
+            echo "[-] PID not found!"
+          fi
+
           adb -s localhost:5555 logcat -d | grep -iE 'indomaret|AndroidRuntime|ProtectedApp' | tail -n 35 || true
 
           echo "=== DAFTAR FILE DUMPED DEX ==="
