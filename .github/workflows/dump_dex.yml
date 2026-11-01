@@ -57,7 +57,7 @@ jobs:
           adb connect localhost:5555 || true
 
           python3 -m venv ~/venv
-          ~/venv/bin/pip install frida frida-tools
+          ~/venv/bin/pip install frida frida-tools frida-dexdump
 
           # Setup Frida Server di Android
           curl -sL https://github.com/frida/frida/releases/download/17.25.0/frida-server-17.25.0-android-arm64.xz -o /tmp/frida.xz
@@ -70,149 +70,27 @@ jobs:
 
           mkdir -p ~/dumped_dex
 
-          cat << 'EOF' > /tmp/stealth_dumper.py
-          import frida, time, os, sys, hashlib
+          # Launch activity via am start
+          echo "[*] Launching Klik Indomaret activity..."
+          adb -s localhost:5555 shell am start -n com.indomaret.klikindomaret/.ngsCexmFBytBw
+          sleep 6
 
-          device = frida.get_usb_device()
-          print("[*] Spawning com.indomaret.klikindomaret with JNI_OnLoad bypass...")
-          pid = device.spawn(["com.indomaret.klikindomaret"])
-          session = device.attach(pid)
-
-          out_dir = os.path.expanduser("~/dumped_dex")
-          os.makedirs(out_dir, exist_ok=True)
-          seen_md5 = set()
-          dump_count = 0
-
-          def on_message(message, data):
-              global dump_count
-              if message.get('type') == 'send' and data:
-                  m = hashlib.md5(data).hexdigest()
-                  if m not in seen_md5:
-                      seen_md5.add(m)
-                      dump_count += 1
-                      fpath = os.path.join(out_dir, f"intercepted_{dump_count:02d}_{m[:8]}.dex")
-                      with open(fpath, "wb") as f:
-                          f.write(data)
-                      print(f"[🔥 INTERCEPTED DEX] Saved: {fpath} ({len(data)/1024/1024:.2f} MB)")
-
-          js_code = """
-          // 1. Hook exit & abort to prevent process termination
-          ['exit', '_exit', 'abort'].forEach(function(sym) {
-              var p = Module.findExportByName("libc.so", sym);
-              if (p) {
-                  Interceptor.attach(p, {
-                      onEnter: function(args) {
-                          console.log("[🛡️] Prevented " + sym + " from killing process!");
-                          Thread.sleep(60);
-                      }
-                  });
-              }
-          });
-
-          // 2. Hook JNI_OnLoad in libdexprotector.so to force JNI_VERSION_1_4 (0x10004)
-          var dlopenSym = Module.findExportByName(null, "android_dlopen_ext");
-          if (!dlopenSym) dlopenSym = Module.findExportByName(null, "dlopen");
-          if (dlopenSym) {
-              Interceptor.attach(dlopenSym, {
-                  onEnter: function(args) {
-                      this.path = args[0] ? args[0].readCString() : "";
-                  },
-                  onLeave: function(retval) {
-                      if (this.path && this.path.indexOf("dexprotector") !== -1) {
-                          console.log("[+] libdexprotector.so loaded! Hooking JNI_OnLoad...");
-                          var onLoad = Module.findExportByName("libdexprotector.so", "JNI_OnLoad");
-                          if (onLoad) {
-                              Interceptor.attach(onLoad, {
-                                  onLeave: function(r) {
-                                      console.log("[*] Original JNI_OnLoad returned: " + r.toInt32());
-                                      r.replace(ptr(0x00010004));
-                                      console.log("[🔥] Replaced JNI_OnLoad return value with JNI_VERSION_1_4 (0x10004)!");
-                                  }
-                              });
-                          }
-                      }
-                  }
-              });
-          }
-
-          // 3. Hook DexFile::OpenCommon to intercept decrypted DEX directly in memory
-          var artModule = Process.findModuleByName("libart.so");
-          if (artModule) {
-              artModule.enumerateExports().forEach(function(exp) {
-                  if (exp.name.indexOf("DexFile") !== -1 && exp.name.indexOf("OpenCommon") !== -1) {
-                      console.log("[+] Hooking Art OpenCommon: " + exp.name);
-                      try {
-                          Interceptor.attach(exp.address, {
-                              onEnter: function(args) {
-                                  var base = args[1];
-                                  var size = args[2].toInt32();
-                                  try {
-                                      var magic = base.readCString(4);
-                                      if (magic === "dex\\n") {
-                                          send({ type: "dex_opened", size: size }, base.readByteArray(size));
-                                      }
-                                  } catch(e) {}
-                              }
-                          });
-                      } catch(e) {}
-                  }
-              });
-          }
-
-          rpc.exports = {
-              scandex: function() {
-                  var list = [];
-                  Process.enumerateRanges('r--').forEach(function(m) {
-                      try {
-                          var magic = m.base.readCString(4);
-                          if (magic === "dex\\n") {
-                              var size = m.base.add(0x20).readU32();
-                              if (size > 0x1000 && size < 0x3000000) {
-                                  list.push({ base: m.base.toString(), size: size });
-                              }
-                          }
-                      } catch(e) {}
-                  });
-                  return list;
-              },
-              dumpbytes: function(baseStr, size) {
-                  return ptr(baseStr).readByteArray(size);
-              }
-          };
-          """
-
-          script = session.create_script(js_code)
-          script.on('message', on_message)
-          script.load()
-
-          device.resume(pid)
-          print("[*] App resumed! Waiting 15s for full initialization and decryption...")
-          time.sleep(15)
-
-          # Sweep memory ranges
-          try:
-              ranges = script.exports_sync.scandex()
-              print(f"[*] Memory range scan found {len(ranges)} candidates")
-              for item in ranges:
-                  data = script.exports_sync.dumpbytes(item['base'], item['size'])
-                  if data:
-                      m = hashlib.md5(data).hexdigest()
-                      if m not in seen_md5:
-                          seen_md5.add(m)
-                          dump_count += 1
-                          fpath = os.path.join(out_dir, f"memory_dump_{dump_count:02d}_{m[:8]}.dex")
-                          with open(fpath, "wb") as f:
-                              f.write(data)
-                          print(f"[+] Dumped DEX: {fpath} ({item['size']/1024/1024:.2f} MB)")
-          except Exception as e:
-              print(f"[-] Scan exception: {e}")
-
-          print(f"[✔] Total file DEX terdekripsi yang tersimpan: {len(seen_md5)}")
-          session.detach()
-          EOF
-
-          ~/venv/bin/python /tmp/stealth_dumper.py || true
+          # Check running process
+          PID=$(adb -s localhost:5555 shell pidof com.indomaret.klikindomaret | tr -d '\r' | awk '{print $1}')
+          echo "Process PID: $PID"
           adb -s localhost:5555 logcat -d | grep -iE 'indomaret|AndroidRuntime|ProtectedApp' | tail -n 35 || true
+
+          # If running, dump immediately with frida-dexdump
+          if [ -n "$PID" ]; then
+            echo "[🔥] Target PID $PID found! Running frida-dexdump..."
+            ~/venv/bin/frida-dexdump -U -p "$PID" -o ~/dumped_dex/ -d || true
+          fi
+
+          # Also attempt spawn-based dump as backup
+          if [ ! "$(ls -A ~/dumped_dex)" ]; then
+            echo "[*] Trying frida-dexdump with early spawn mode..."
+            ~/venv/bin/frida-dexdump -U -f com.indomaret.klikindomaret --sleep 5 -o ~/dumped_dex/ -d || true
+          fi
 
           echo "=== DAFTAR FILE DUMPED DEX ==="
           ls -lh ~/dumped_dex/
