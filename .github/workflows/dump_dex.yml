@@ -9,49 +9,134 @@ jobs:
     steps:
       - name: Setup Kernel & Redroid Android
         run: |
+          echo "=== 1. PREPARE KERNEL & PACKAGES ==="
           sudo modprobe binder_linux
-          sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils
+          sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils wget
+          
+          echo "=== 2. RUN REDROID ANDROID 11 ==="
           sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest
-          sleep 8
-          adb connect localhost:5555
+          
+          echo "=== 3. WAIT FOR ANDROID ADB READY ==="
+          for i in {1..35}; do
+            adb connect localhost:5555 || true
+            if adb devices | grep -q "localhost:5555.*device$"; then
+              echo "Redroid SIAP!"
+              break
+            fi
+            sleep 2
+          done
           adb devices
 
       - name: Download & Install APK
         run: |
+          adb connect localhost:5555 || true
           wget -q -O /tmp/klikindo.apk https://github.com/usernameuser87/arm64-terminal/releases/download/apk-v1/klikindomaret_signed.apk
-          adb -s localhost:5555 install /tmp/klikindo.apk
+          ls -lh /tmp/klikindo.apk
+          adb -s localhost:5555 install -r /tmp/klikindo.apk
+          adb -s localhost:5555 shell pm list packages | grep indomaret
 
-      - name: Setup Frida Server & Dump DEX
+      - name: Setup Frida Server & Dump with Bypass Hook
         run: |
+          adb connect localhost:5555 || true
           python3 -m venv ~/venv
-          ~/venv/bin/pip install frida frida-tools frida-dexdump
+          ~/venv/bin/pip install frida frida-tools
 
-          # Setup Frida Server
+          # Nyalakan Frida Server DULUAN di Android
           curl -sL https://github.com/frida/frida/releases/download/17.25.0/frida-server-17.25.0-android-arm64.xz -o /tmp/frida.xz
           xz -d -f /tmp/frida.xz
           adb -s localhost:5555 push /tmp/frida /data/local/tmp/frida-server
           adb -s localhost:5555 shell "chmod 755 /data/local/tmp/frida-server"
-          adb -s localhost:5555 logcat -c || true
+          adb -s localhost:5555 shell "nohup /data/local/tmp/frida-server >/dev/null 2>&1 < /dev/null &"
+          sleep 4
+          ~/venv/bin/frida-ps -U | head -n 10
 
-          # Launch App & Dump Memory
           mkdir -p ~/dumped_dex
-          cd ~/dumped_dex
-          adb -s localhost:5555 shell pm list packages | grep -i indo || true
-          adb -s localhost:5555 shell pm path com.indomaret.klikindomaret || true
-          adb -s localhost:5555 shell am start -n com.indomaret.klikindomaret/.ngsCexmFBytBw || true
-          sleep 10
-          echo "PID sebelum frida-server:"
-          adb -s localhost:5555 shell pidof com.indomaret.klikindomaret || true
-          adb -s localhost:5555 logcat -d | grep -iE 'indomaret|AndroidRuntime|FATAL|ProtectedApp|dexprotector|liapp' | tail -n 60 || true
-          adb -s localhost:5555 shell "/data/local/tmp/frida-server >/dev/null 2>&1 &"
-          sleep 3
-          echo "PID sesudah frida-server:"
-          adb -s localhost:5555 shell pidof com.indomaret.klikindomaret || true
-          ~/venv/bin/frida-dexdump -U -n com.indomaret.klikindomaret --sleep 5 || true
+          
+          cat << 'EOF' > /tmp/dumper.py
+          import frida, time, os, sys, hashlib
+
+          device = frida.get_usb_device()
+          print("[*] Spawning com.indomaret.klikindomaret dengan Certificate Bypass...")
+          pid = device.spawn(["com.indomaret.klikindomaret"])
+          session = device.attach(pid)
+
+          js_hook = """
+          Java.perform(function() {
+              console.log("[*] Hooking ProtectedApp.b()...");
+              try {
+                  var ProtectedApp = Java.use("edts.klikidm.android.ProtectedApp");
+                  ProtectedApp.b.implementation = function() {
+                      console.log("[🔥] BYPASS: Certificate Check dimatikan! Aplikasi tidak akan crash.");
+                      return;
+                  };
+              } catch(e) {
+                  console.log("[-] Error hooking: " + e);
+              }
+          });
+
+          rpc.exports = {
+              scandex: function() {
+                  var list = [];
+                  Process.enumerateRanges('r--').forEach(function(m) {
+                      try {
+                          var magic = m.base.readCString(4);
+                          if (magic === "dex\\n") {
+                              var size = m.base.add(0x20).readU32();
+                              if (size > 0x1000 && size < 0x3000000) {
+                                  list.push({ base: m.base.toString(), size: size });
+                              }
+                          }
+                      } catch(e) {}
+                  });
+                  return list;
+              },
+              dumpbytes: function(baseStr, size) {
+                  return ptr(baseStr).readByteArray(size);
+              }
+          };
+          """
+
+          script = session.create_script(js_hook)
+          script.load()
+
+          device.resume(pid)
+          print("[*] Aplikasi berjalan normal, menunggu DexProtector mendekripsi assets.dat (15 detik)...")
+          time.sleep(15)
+
+          out_dir = os.path.expanduser("~/dumped_dex")
+          os.makedirs(out_dir, exist_ok=True)
+          dex_list = script.exports_sync.scandex()
+          print(f"[🔥] Berhasil menemukan {len(dex_list)} blok DEX di RAM!")
+
+          seen_md5 = set()
+          idx = 1
+          for item in dex_list:
+              base = item['base']
+              size = item['size']
+              try:
+                  data = script.exports_sync.dumpbytes(base, size)
+                  m = hashlib.md5(data).hexdigest()
+                  if m in seen_md5:
+                      continue
+                  seen_md5.add(m)
+                  file_path = os.path.join(out_dir, f"decrypted_{idx:02d}_{m[:8]}.dex")
+                  with open(file_path, "wb") as f:
+                      f.write(data)
+                  print(f"[+] Dumped: {file_path} (Ukuran: {size/1024/1024:.2f} MB)")
+                  idx += 1
+              except Exception as e:
+                  print(f"[-] Gagal dump {base}: {e}")
+
+          session.detach()
+          print("[✔] Proses dumping memori selesai!")
+          EOF
+
+          ~/venv/bin/python /tmp/dumper.py
           ls -lh ~/dumped_dex
 
       - name: Upload Dumped DEX to Artifacts
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: klikindomaret-dumped-dex
           path: ~/dumped_dex/
