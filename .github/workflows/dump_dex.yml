@@ -68,13 +68,14 @@ jobs:
           APK_PATH=$(adb -s localhost:5555 shell pm path com.indomaret.klikindomaret | tr -d '\r' | cut -d: -f2 | head -n 1)
           echo "Target APK Path: $APK_PATH"
 
-          # Get native library dir
-          LIB_DIR="/data/app/$(adb -s localhost:5555 shell ls /data/app/ | grep com.indomaret.klikindomaret | tr -d '\r')/lib/arm64"
-          echo "Native Lib Dir: $LIB_DIR"
+          # Extract libdexprotector.so from APK and place into /data/local/tmp/
+          unzip -p /tmp/klikindo.apk lib/arm64-v8a/libdexprotector.so > /tmp/libdex.so
+          adb -s localhost:5555 push /tmp/libdex.so /data/local/tmp/libdexprotector.so
+          adb -s localhost:5555 shell "chmod 777 /data/local/tmp/libdexprotector.so"
 
           # Execute Decryptor via app_process
           echo "[*] Invoking Decryptor via app_process..."
-          adb -s localhost:5555 shell "LD_LIBRARY_PATH=$LIB_DIR:/system/lib64 CLASSPATH=/data/local/tmp/decryptor.dex:$APK_PATH app_process /data/local/tmp Decryptor"
+          adb -s localhost:5555 shell "CLASSPATH=/data/local/tmp/decryptor.dex:$APK_PATH app_process /data/local/tmp Decryptor"
 
           mkdir -p $GITHUB_WORKSPACE/results
           adb -s localhost:5555 pull /data/local/tmp/all_decrypted_strings.txt $GITHUB_WORKSPACE/results/ || true
