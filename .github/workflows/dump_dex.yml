@@ -14,7 +14,8 @@ jobs:
         run: |
           echo "=== 1. PREPARE KERNEL & PACKAGES ==="
           sudo modprobe binder_linux
-          sudo apt-get update && sudo apt-get install -y adb wget zip
+          sudo sysctl -w fs.suid_dumpable=2 || true
+          sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils wget zip
           
           echo "=== 2. RUN REDROID STANDARD ==="
           sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest
@@ -55,33 +56,119 @@ jobs:
           done
           adb -s localhost:5555 shell pm list packages | grep indomaret
 
-      - name: Execute Native DexProtector String Decryptor
+      - name: Setup Root Frida Server
         run: |
           adb connect localhost:5555 || true
-          
-          # Push decryptor DEX and enc strings
-          adb -s localhost:5555 push decryptor.dex /data/local/tmp/decryptor.dex
-          adb -s localhost:5555 push all_enc_strings.txt /data/local/tmp/all_enc_strings.txt
-          adb -s localhost:5555 shell "chmod 777 /data/local/tmp/decryptor.dex /data/local/tmp/all_enc_strings.txt"
+          python3 -m venv ~/venv
+          ~/venv/bin/pip install frida frida-tools
 
-          # Get base APK path
-          APK_PATH=$(adb -s localhost:5555 shell pm path com.indomaret.klikindomaret | tr -d '\r' | cut -d: -f2 | head -n 1)
-          echo "Target APK Path: $APK_PATH"
+          curl -sL https://github.com/frida/frida/releases/download/17.25.0/frida-server-17.25.0-android-arm64.xz -o /tmp/frida.xz
+          xz -d -f /tmp/frida.xz
+          adb -s localhost:5555 push /tmp/frida /data/local/tmp/frida-server
+          adb -s localhost:5555 shell "chmod 755 /data/local/tmp/frida-server"
+          adb -s localhost:5555 shell "nohup /data/local/tmp/frida-server >/dev/null 2>&1 < /dev/null &"
+          sleep 4
+          ~/venv/bin/frida-ps -U | head -n 10
 
-          # Extract libdexprotector.so from APK and place into /data/local/tmp/
-          unzip -p /tmp/klikindo.apk lib/arm64-v8a/libdexprotector.so > /tmp/libdex.so
-          adb -s localhost:5555 push /tmp/libdex.so /data/local/tmp/libdexprotector.so
-          adb -s localhost:5555 shell "chmod 777 /data/local/tmp/libdexprotector.so"
-
-          # Execute Decryptor via app_process
-          echo "[*] Invoking Decryptor via app_process..."
-          adb -s localhost:5555 shell "CLASSPATH=/data/local/tmp/decryptor.dex:$APK_PATH app_process /data/local/tmp Decryptor"
-
+      - name: Decrypt All 2903 Strings via Frida Hook
+        run: |
+          adb connect localhost:5555 || true
           mkdir -p $GITHUB_WORKSPACE/results
-          adb -s localhost:5555 pull /data/local/tmp/all_decrypted_strings.txt $GITHUB_WORKSPACE/results/ || true
+
+          # Push target strings list
+          adb -s localhost:5555 push all_enc_strings.txt /data/local/tmp/all_enc_strings.txt
+
+          cat << 'PYEOF' > /tmp/runner_decrypt.py
+          import frida, time, sys, os
+
+          device = frida.get_usb_device()
+          print("[*] Spawning com.indomaret.klikindomaret under Frida control...")
+          pid = device.spawn(["com.indomaret.klikindomaret"])
+          session = device.attach(pid)
+
+          js_code = """
+          // 1. Prevent abort/exit from interrupting string batch decryption
+          ['exit', '_exit', 'abort'].forEach(function(sym) {
+              var p = Module.findExportByName("libc.so", sym);
+              if (p) {
+                  Interceptor.attach(p, {
+                      onEnter: function() {
+                          console.log("[🛡️] Prevented " + sym + " from aborting!");
+                          Thread.sleep(60);
+                      }
+                  });
+              }
+          });
+
+          rpc.exports = {
+              decryptbatch: function(encList) {
+                  var results = {};
+                  Java.perform(function() {
+                      try {
+                          var ProtectedApp = Java.use("edts.klikidm.android.ProtectedApp");
+                          for (var i = 0; i < encList.length; i++) {
+                              var pair = encList[i];
+                              var name = pair[0];
+                              var enc = pair[1];
+                              try {
+                                  var plain = ProtectedApp.s(enc);
+                                  results[name] = plain;
+                              } catch(e) {
+                                  results[name] = "[ERR: " + e + "]";
+                              }
+                          }
+                      } catch(err) {
+                          console.log("Java.perform error: " + err);
+                      }
+                  });
+                  return results;
+              }
+          };
+          """
+
+          script = session.create_script(js_code)
+          script.load()
+
+          print("[*] Resuming app to let DexProtector initialize...")
+          device.resume(pid)
+          time.sleep(3)
+
+          # Read all 2903 strings
+          with open("all_enc_strings.txt", "r") as f:
+              lines = [l.strip().split("|", 1) for l in f if "|" in l]
+
+          print(f"[*] Loaded {len(lines)} encrypted strings. Starting batch decryption...")
+
+          out_file = os.path.expanduser("~/results/all_decrypted_strings.txt")
+          os.makedirs(os.path.dirname(out_file), exist_ok=True)
+
+          # Process in chunks of 100
+          chunk_size = 100
+          decrypted_total = 0
+
+          with open(out_file, "w", encoding="utf-8") as out:
+              for i in range(0, len(lines), chunk_size):
+                  chunk = lines[i:i+chunk_size]
+                  try:
+                      res = script.exports_sync.decryptbatch(chunk)
+                      for name, plain in res.items():
+                          out.write(f"{name}={plain}\n")
+                          decrypted_total += 1
+                      print(f"[+] Decrypted chunk {i//chunk_size + 1}/{(len(lines)+chunk_size-1)//chunk_size} ({decrypted_total}/{len(lines)})")
+                  except Exception as e:
+                      print(f"[-] Chunk error: {e}")
+
+          print(f"[✔] Batch decryption complete! Saved {decrypted_total} decrypted strings to {out_file}")
+          session.detach()
+          PYEOF
+
+          cp /tmp/runner_decrypt.py $GITHUB_WORKSPACE/runner_decrypt.py
+          ~/venv/bin/python /tmp/runner_decrypt.py || true
+
+          cp ~/results/all_decrypted_strings.txt $GITHUB_WORKSPACE/results/ || true
 
           echo "=== PREVIEW DECRYPTED STRINGS ==="
-          head -n 35 $GITHUB_WORKSPACE/results/all_decrypted_strings.txt || true
+          head -n 40 $GITHUB_WORKSPACE/results/all_decrypted_strings.txt || true
           wc -l $GITHUB_WORKSPACE/results/all_decrypted_strings.txt || true
 
       - name: Upload Decrypted Strings to Artifacts
