@@ -11,7 +11,7 @@ jobs:
         run: |
           echo "=== 1. PREPARE KERNEL & PACKAGES ==="
           sudo modprobe binder_linux
-          sudo apt-get update && sudo apt-get install -y adb python3 wget zip
+          sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils wget zip
           
           echo "=== 2. RUN REDROID STANDARD ==="
           sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest
@@ -52,111 +52,43 @@ jobs:
           done
           adb -s localhost:5555 shell pm list packages | grep indomaret
 
-      - name: Host Continuous RAM Sweeper (Watch & Capture Decrypted Payload)
+      - name: Attach-Only Frida Dump (Post-Init Injection)
         run: |
           adb connect localhost:5555 || true
-          sudo mkdir -p /tmp/dumped_dex
-          sudo chmod 777 /tmp/dumped_dex
-
-          cat << 'PYEOF' > /tmp/continuous_dumper.py
-          import sys, os, struct, time, hashlib, subprocess
-
-          out_dir = "/tmp/dumped_dex"
-          seen_md5 = set()
-          dump_count = 0
-
-          def get_target_pid():
-              try:
-                  out = subprocess.check_output(["sudo", "docker", "top", "redroid"], text=True)
-                  for line in out.splitlines():
-                      if "com.indomaret.klikindomaret" in line and "p3e" not in line:
-                          parts = line.split()
-                          return int(parts[1])
-              except:
-                  pass
-              return None
-
-          print("[*] Launching app via adb am start...")
-          subprocess.run(["adb", "-s", "localhost:5555", "shell", "am", "start", "-n", "com.indomaret.klikindomaret/.ngsCexmFBytBw"])
-
-          # Sweep memory dynamically across process lifetime
-          start_time = time.time()
-          target_pid = None
-
-          while time.time() - start_time < 15:
-              if not target_pid:
-                  target_pid = get_target_pid()
-                  if target_pid:
-                      print(f"[🔥 TARGET PID DETECTED] Host PID: {target_pid}")
-
-              if target_pid:
-                  try:
-                      with open(f"/proc/{target_pid}/maps", "r") as mf:
-                          maps = mf.readlines()
-                  except:
-                      # Process might have died, check for new instance
-                      target_pid = None
-                      time.sleep(0.1)
-                      continue
-
-                  try:
-                      mem = open(f"/proc/{target_pid}/mem", "rb", 0)
-                  except:
-                      target_pid = None
-                      time.sleep(0.1)
-                      continue
-
-                  for line in maps:
-                      parts = line.split()
-                      if len(parts) < 2: continue
-                      addr_range = parts[0]
-                      perms = parts[1]
-                      # Focus on anonymous and heap/mmap memory regions
-                      if "r" in perms:
-                          start_hex, end_hex = addr_range.split("-")
-                          start = int(start_hex, 16)
-                          end = int(end_hex, 16)
-                          size = end - start
-                          if 0x2000 < size < 0x8000000:
-                              try:
-                                  mem.seek(start)
-                                  chunk = mem.read(size)
-                                  pos = 0
-                                  while True:
-                                      idx = chunk.find(b"dex\n", pos)
-                                      if idx == -1: break
-                                      if idx + 0x24 <= len(chunk):
-                                          dex_size = struct.unpack("<I", chunk[idx+0x20 : idx+0x24])[0]
-                                          if 0x2000 < dex_size <= (len(chunk) - idx + 0x1000):
-                                              dex_bytes = chunk[idx : idx + dex_size]
-                                              m = hashlib.md5(dex_bytes).hexdigest()
-                                              if m not in seen_md5:
-                                                  seen_md5.add(m)
-                                                  dump_count += 1
-                                                  fpath = os.path.join(out_dir, f"decrypted_{dump_count:02d}_{m[:8]}.dex")
-                                                  with open(fpath, "wb") as out:
-                                                      out.write(dex_bytes)
-                                                  desc = parts[-1] if len(parts) >= 6 else "anonymous"
-                                                  print(f"[🔥 SUCCESS DUMP] {fpath} ({len(dex_bytes)/1024/1024:.2f} MB) from {desc}")
-                                      pos = idx + 4
-                              except:
-                                  pass
-                  mem.close()
-              time.sleep(0.1)
-
-          print(f"[✔] Total decrypted DEX files captured: {len(seen_md5)}")
-          PYEOF
-
-          sudo python3 /tmp/continuous_dumper.py
-
           mkdir -p $GITHUB_WORKSPACE/dumped_dex
-          if compgen -G "/tmp/dumped_dex/*.dex" > /dev/null; then
-            cp /tmp/dumped_dex/*.dex $GITHUB_WORKSPACE/dumped_dex/
-            cd $GITHUB_WORKSPACE/dumped_dex
-            zip -j /tmp/all_decrypted_dex.zip *.dex || true
+
+          python3 -m venv ~/venv
+          ~/venv/bin/pip install frida frida-tools frida-dexdump
+
+          # Setup Frida Server di Android
+          curl -sL https://github.com/frida/frida/releases/download/17.25.0/frida-server-17.25.0-android-arm64.xz -o /tmp/frida.xz
+          xz -d -f /tmp/frida.xz
+          adb -s localhost:5555 push /tmp/frida /data/local/tmp/frida-server
+          adb -s localhost:5555 shell "chmod 755 /data/local/tmp/frida-server"
+          adb -s localhost:5555 shell "nohup /data/local/tmp/frida-server >/dev/null 2>&1 < /dev/null &"
+          sleep 4
+          ~/venv/bin/frida-ps -U | head -n 10
+
+          echo "[*] Launching app natively (clean init)..."
+          adb -s localhost:5555 shell am start -n com.indomaret.klikindomaret/.ngsCexmFBytBw
+
+          # Poll for running PID
+          PID=""
+          for i in {1..30}; do
+            PID=$(adb -s localhost:5555 shell pidof com.indomaret.klikindomaret | tr -d '\r' | awk '{print $1}')
+            if [ -n "$PID" ]; then
+              echo "[🔥 TARGET FOUND] Android PID: $PID"
+              break
+            fi
+            sleep 0.05
+          done
+
+          if [ -n "$PID" ]; then
+            echo "[*] Attaching frida-dexdump to active PID $PID..."
+            ~/venv/bin/frida-dexdump -U -p "$PID" -o $GITHUB_WORKSPACE/dumped_dex/ -d || true
           fi
 
-          echo "=== DAFTAR FILE DUMPED DEX DI RUNNER ==="
+          echo "=== DAFTAR FILE DUMPED DEX ==="
           ls -lh $GITHUB_WORKSPACE/dumped_dex/
 
       - name: Upload Dumped DEX to Artifacts
