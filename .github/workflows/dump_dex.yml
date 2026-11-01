@@ -1,0 +1,47 @@
+name: Dump DexProtector ARM64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dump:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Setup Kernel & Redroid Android
+        run: |
+          sudo modprobe binder_linux
+          sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils
+          sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest
+          sleep 8
+          adb connect localhost:5555
+          adb devices
+
+      - name: Download & Install APK
+        run: |
+          wget -q -O /tmp/klikindo.apk https://andrew-care-reservoir-reliable.trycloudflare.com/klikindomaret_signed.apk
+          adb install /tmp/klikindo.apk
+
+      - name: Setup Frida Server & Dump DEX
+        run: |
+          python3 -m venv ~/venv
+          ~/venv/bin/pip install frida frida-tools frida-dexdump
+          
+          # Setup Frida Server
+          curl -sL https://github.com/frida/frida/releases/download/16.5.9/frida-server-16.5.9-android-arm64.xz -o /tmp/frida.xz
+          xz -d -f /tmp/frida.xz
+          adb push /tmp/frida /data/local/tmp/frida-server
+          adb shell "chmod 755 /data/local/tmp/frida-server"
+          adb shell "/data/local/tmp/frida-server >/dev/null 2>&1 &"
+          sleep 3
+
+          # Launch App & Dump Memory
+          mkdir -p ~/dumped_dex
+          cd ~/dumped_dex
+          ~/venv/bin/frida-dexdump -U -f com.indomaret.klikindomaret --sleep 5 || true
+          ls -lh ~/dumped_dex
+
+      - name: Upload Dumped DEX to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: klikindomaret-dumped-dex
+          path: ~/dumped_dex/
