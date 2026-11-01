@@ -27,6 +27,10 @@ jobs:
             echo "Waiting for Android boot_completed... ($i/40)"
             sleep 2
           done
+          adb -s localhost:5555 root || true
+          sleep 2
+          adb connect localhost:5555 || true
+          adb -s localhost:5555 shell "id"
           adb devices
 
       - name: Download & Install Untouched Signed APK
@@ -44,13 +48,17 @@ jobs:
           done
           adb -s localhost:5555 shell pm list packages | grep indomaret
 
-      - name: Setup Frida Server & Dump DEX
+      - name: Setup Root Frida Server & Dump DEX
         run: |
           adb connect localhost:5555 || true
+          adb -s localhost:5555 root || true
+          sleep 2
+          adb connect localhost:5555 || true
+
           python3 -m venv ~/venv
           ~/venv/bin/pip install frida frida-tools
 
-          # Setup Frida Server di Android
+          # Setup Frida Server sebagai ROOT di Android
           curl -sL https://github.com/frida/frida/releases/download/17.25.0/frida-server-17.25.0-android-arm64.xz -o /tmp/frida.xz
           xz -d -f /tmp/frida.xz
           adb -s localhost:5555 push /tmp/frida /data/local/tmp/frida-server
@@ -61,11 +69,11 @@ jobs:
 
           mkdir -p ~/dumped_dex
 
-          # Set app into waiting-for-debugger mode so it pauses before ProtectedApp.b() executes!
+          # Set app into waiting-for-debugger mode
           echo "[*] Setting debug-app waiting mode..."
           adb -s localhost:5555 shell am set-debug-app -w --persistent com.indomaret.klikindomaret
 
-          # Launch the activity - it will pause at start waiting for debugger/Frida
+          # Launch activity
           echo "[*] Launching paused activity..."
           adb -s localhost:5555 shell am start -n com.indomaret.klikindomaret/.ngsCexmFBytBw
           sleep 3
@@ -79,7 +87,7 @@ jobs:
 
           target = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else "com.indomaret.klikindomaret"
           device = frida.get_usb_device()
-          print(f"[*] Attaching to paused process PID: {target}...")
+          print(f"[*] Attaching to paused process PID: {target} as ROOT...")
           session = device.attach(target)
 
           js_code = """
