@@ -52,87 +52,108 @@ jobs:
           done
           adb -s localhost:5555 shell pm list packages | grep indomaret
 
-      - name: Launch App & Dump Memory
+      - name: Zero-Intrusion Kernel RAM Dumper
         run: |
           adb connect localhost:5555 || true
-          mkdir -p $GITHUB_WORKSPACE/dumped_dex
           sudo mkdir -p /tmp/dumped_dex
           sudo chmod 777 /tmp/dumped_dex
+          mkdir -p $GITHUB_WORKSPACE/dumped_dex
 
-          echo "[*] Launching Immortal Klik Indomaret APK..."
-          adb -s localhost:5555 shell am start -n com.indomaret.klikindomaret/.ngsCexmFBytBw
-
-          echo "[*] Waiting 6 seconds for full DexProtector assets.dat decryption..."
-          sleep 6
-
-          adb -s localhost:5555 logcat -d | grep -iE 'indomaret|AndroidRuntime|ProtectedApp' | tail -n 30 || true
-
-          cat << 'PYEOF' > /tmp/dumper.py
-          import sys, os, struct, hashlib, subprocess
+          cat << 'PYEOF' > /tmp/host_dumper.py
+          import sys, os, struct, time, hashlib, subprocess
 
           out_dir = "/tmp/dumped_dex"
           seen_md5 = set()
           dump_count = 0
 
-          out = subprocess.check_output(["sudo", "docker", "top", "redroid"], text=True)
+          def find_target_pid():
+              try:
+                  out = subprocess.check_output(["sudo", "docker", "top", "redroid"], text=True)
+                  for line in out.splitlines():
+                      if "com.indomaret.klikindomaret" in line and "p3e" not in line:
+                          parts = line.split()
+                          return int(parts[1])
+              except:
+                  pass
+              return None
+
+          print("[*] Launching app via adb am start...")
+          subprocess.run(["adb", "-s", "localhost:5555", "shell", "am", "start", "-n", "com.indomaret.klikindomaret/.ngsCexmFBytBw"])
+
           target_pid = None
-          for line in out.splitlines():
-              if "com.indomaret.klikindomaret" in line and "p3e" not in line:
-                  parts = line.split()
-                  target_pid = int(parts[1])
+          for _ in range(120):
+              target_pid = find_target_pid()
+              if target_pid:
                   break
+              time.sleep(0.05)
 
           if not target_pid:
-              print("[-] Process PID not found in docker top!")
+              print("[-] Process PID not found!")
               sys.exit(0)
 
-          print(f"[🔥 TARGET PID ACTIVE] Host PID: {target_pid}")
+          print(f"[🔥 TARGET DETECTED] Host PID: {target_pid}")
+          # Wait 0.25s for native unpacker to decrypt assets.dat into memory
+          time.sleep(0.25)
+          subprocess.run(["sudo", "kill", "-STOP", str(target_pid)])
+          print(f"[❄️ FROZEN] Target host PID {target_pid} frozen in RAM via SIGSTOP!")
 
-          with open(f"/proc/{target_pid}/maps", "r") as mf:
-              maps = mf.readlines()
+          try:
+              with open(f"/proc/{target_pid}/maps", "r") as mf:
+                  maps = mf.readlines()
+          except Exception as e:
+              print(f"[-] Could not read maps: {e}")
+              maps = []
 
-          print(f"[*] Total mappings: {len(maps)}")
-          mem = open(f"/proc/{target_pid}/mem", "rb", 0)
+          print(f"[*] Total memory mappings in target: {len(maps)}")
 
-          for line in maps:
-              parts = line.split()
-              if len(parts) < 2: continue
-              addr_range = parts[0]
-              perms = parts[1]
-              if "r" in perms:
-                  start_hex, end_hex = addr_range.split("-")
-                  start = int(start_hex, 16)
-                  end = int(end_hex, 16)
-                  size = end - start
-                  if 0x2000 < size < 0x8000000:
-                      try:
-                          mem.seek(start)
-                          chunk = mem.read(size)
-                          pos = 0
-                          while True:
-                              idx = chunk.find(b"dex\n", pos)
-                              if idx == -1: break
-                              if idx + 0x24 <= len(chunk):
-                                  dex_size = struct.unpack("<I", chunk[idx+0x20 : idx+0x24])[0]
-                                  if 0x2000 < dex_size <= (len(chunk) - idx + 0x1000):
-                                      dex_bytes = chunk[idx : idx + dex_size]
-                                      m = hashlib.md5(dex_bytes).hexdigest()
-                                      if m not in seen_md5:
-                                          seen_md5.add(m)
-                                          dump_count += 1
-                                          fpath = os.path.join(out_dir, f"app_dex_{dump_count:02d}_{m[:8]}.dex")
-                                          with open(fpath, "wb") as out:
-                                              out.write(dex_bytes)
-                                          desc = parts[-1] if len(parts) >= 6 else "anonymous"
-                                          print(f"[🔥 SUCCESS DUMP] {fpath} ({len(dex_bytes)/1024/1024:.2f} MB) from {desc}")
-                              pos = idx + 4
-                      except:
-                          pass
-          mem.close()
-          print(f"[✔] Total decrypted DEX files captured: {len(seen_md5)}")
+          try:
+              mem = open(f"/proc/{target_pid}/mem", "rb", 0)
+          except Exception as e:
+              print(f"[-] Could not open /proc/{target_pid}/mem: {e}")
+              mem = None
+
+          if mem:
+              for line in maps:
+                  parts = line.split()
+                  if len(parts) < 2: continue
+                  addr_range = parts[0]
+                  perms = parts[1]
+                  if "r" in perms:
+                      start_hex, end_hex = addr_range.split("-")
+                      start = int(start_hex, 16)
+                      end = int(end_hex, 16)
+                      size = end - start
+                      if 0x1000 < size < 0x8000000:
+                          try:
+                              mem.seek(start)
+                              chunk = mem.read(size)
+                              pos = 0
+                              while True:
+                                  idx = chunk.find(b"dex\n", pos)
+                                  if idx == -1: break
+                                  if idx + 0x24 <= len(chunk):
+                                      dex_size = struct.unpack("<I", chunk[idx+0x20 : idx+0x24])[0]
+                                      if 0x1000 < dex_size <= (len(chunk) - idx + 0x1000):
+                                          dex_bytes = chunk[idx : idx + dex_size]
+                                          m = hashlib.md5(dex_bytes).hexdigest()
+                                          if m not in seen_md5:
+                                              seen_md5.add(m)
+                                              dump_count += 1
+                                              fpath = os.path.join(out_dir, f"memory_dex_{dump_count:02d}_{m[:8]}.dex")
+                                              with open(fpath, "wb") as out:
+                                                  out.write(dex_bytes)
+                                              desc = parts[-1] if len(parts) >= 6 else "anonymous"
+                                              print(f"[🔥 SUCCESS DUMP] {fpath} ({len(dex_bytes)/1024/1024:.2f} MB) from {desc}")
+                                  pos = idx + 4
+                          except Exception as e:
+                              pass
+              mem.close()
+
+          subprocess.run(["sudo", "kill", "-CONT", str(target_pid)])
+          print(f"[✔] Total unique decrypted DEX files dumped: {len(seen_md5)}")
           PYEOF
 
-          sudo python3 /tmp/dumper.py
+          sudo python3 /tmp/host_dumper.py
 
           if compgen -G "/tmp/dumped_dex/*.dex" > /dev/null; then
             cp /tmp/dumped_dex/*.dex $GITHUB_WORKSPACE/dumped_dex/
