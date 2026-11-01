@@ -99,20 +99,39 @@ jobs:
                       print(f"[*] {payload}")
 
           js_code = """
-          // 1. Intercept abort & exit
-          ['exit', '_exit', 'abort'].forEach(function(sym) {
+          // 1. Intercept abort, exit, kill, tgkill to prevent instant death
+          ['exit', '_exit', 'abort', 'kill', 'tgkill'].forEach(function(sym) {
               var p = Module.findExportByName("libc.so", sym);
               if (p) {
                   Interceptor.attach(p, {
                       onEnter: function() {
-                          console.log("[🛡️] Blocked " + sym + " from killing process!");
+                          console.log("[🛡️] Intercepted " + sym + " - sleeping thread to keep memory alive!");
                           Thread.sleep(60);
                       }
                   });
               }
           });
 
-          // 2. Hook Art DexFile::OpenCommon
+          // 2. Intercept Java Uncaught Exception Handler
+          Java.perform(function() {
+              try {
+                  var ThreadClass = Java.use("java.lang.Thread");
+                  var Handler = Java.registerClass({
+                      name: "com.stealth.QuietHandler",
+                      implements: [Java.use("java.lang.Thread$UncaughtExceptionHandler")],
+                      methods: {
+                          uncaughtException: function(t, e) {
+                              console.log("[🛡️ CAUGHT JAVA FATAL] " + e);
+                          }
+                      }
+                  });
+                  ThreadClass.setDefaultUncaughtExceptionHandler(Handler.$new());
+              } catch(e) {
+                  console.log("Handler hook error: " + e);
+              }
+          });
+
+          // 3. Hook Art DexFile::OpenCommon
           var artModule = Process.findModuleByName("libart.so");
           if (artModule) {
               artModule.enumerateExports().forEach(function(exp) {
