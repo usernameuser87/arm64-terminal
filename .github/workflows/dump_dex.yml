@@ -58,7 +58,7 @@ jobs:
           python3 -m venv ~/venv
           ~/venv/bin/pip install frida frida-tools
 
-          # Setup Frida Server sebagai ROOT di Android
+          # Setup Frida Server di Android
           curl -sL https://github.com/frida/frida/releases/download/17.25.0/frida-server-17.25.0-android-arm64.xz -o /tmp/frida.xz
           xz -d -f /tmp/frida.xz
           adb -s localhost:5555 push /tmp/frida /data/local/tmp/frida-server
@@ -73,7 +73,7 @@ jobs:
           echo "[*] Setting debug-app waiting mode..."
           adb -s localhost:5555 shell am set-debug-app -w --persistent com.indomaret.klikindomaret
 
-          # Launch activity
+          # Launch activity (it will pause at start waiting for debugger)
           echo "[*] Launching paused activity..."
           adb -s localhost:5555 shell am start -n com.indomaret.klikindomaret/.ngsCexmFBytBw
           sleep 3
@@ -82,21 +82,64 @@ jobs:
           PID=$(adb -s localhost:5555 shell pidof com.indomaret.klikindomaret | tr -d '\r' | awk '{print $1}')
           echo "Target Paused PID: $PID"
 
-          cat << 'EOF' > /tmp/wait_dumper.py
-          import frida, time, os, sys, hashlib
+          # Forward JDWP port
+          adb -s localhost:5555 forward tcp:8100 jdwp:$PID
+          echo "Forwarded JDWP port 8100 to PID $PID"
 
-          target = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else "com.indomaret.klikindomaret"
+          cat << 'EOF' > /tmp/wait_dumper.py
+          import frida, time, os, sys, hashlib, socket, struct
+
+          pid = int(sys.argv[1])
           device = frida.get_usb_device()
-          print(f"[*] Attaching to paused process PID: {target} as ROOT...")
-          session = device.attach(target)
+          print(f"[*] Attaching to paused process PID: {pid} as ROOT...")
+          session = device.attach(pid)
+
+          out_dir = os.path.expanduser("~/dumped_dex")
+          os.makedirs(out_dir, exist_ok=True)
+          seen_md5 = set()
+          dump_count = 0
+
+          def on_message(message, data):
+              global dump_count
+              if message.get('type') == 'send' and message.get('payload', {}).get('type') == 'dex_opened':
+                  if data:
+                      m = hashlib.md5(data).hexdigest()
+                      if m not in seen_md5:
+                          seen_md5.add(m)
+                          dump_count += 1
+                          fpath = os.path.join(out_dir, f"opencommon_{dump_count:02d}_{m[:8]}.dex")
+                          with open(fpath, "wb") as f:
+                              f.write(data)
+                          print(f"[🔥 INTERCEPTED DEX] Saved to {fpath} ({len(data)/1024/1024:.2f} MB)")
 
           js_code = """
+          rpc.exports = {
+              scandex: function() {
+                  var list = [];
+                  Process.enumerateRanges('r--').forEach(function(m) {
+                      try {
+                          var magic = m.base.readCString(4);
+                          if (magic === "dex\\n") {
+                              var size = m.base.add(0x20).readU32();
+                              if (size > 0x1000 && size < 0x3000000) {
+                                  list.push({ base: m.base.toString(), size: size });
+                              }
+                          }
+                      } catch(e) {}
+                  });
+                  return list;
+              },
+              dumpbytes: function(baseStr, size) {
+                  return ptr(baseStr).readByteArray(size);
+              }
+          };
+
           Java.perform(function() {
               console.log("[*] Injected into paused process!");
               try {
                   var ProtectedApp = Java.use("edts.klikidm.android.ProtectedApp");
                   ProtectedApp.b.implementation = function() {
-                      console.log("[🔥] BYPASSED ProtectedApp.b() Certificate Check!");
+                      console.log("[🔥] BYPASSED ProtectedApp.b() Certificate Check successfully!");
                       return;
                   };
               } catch(e) {
@@ -127,59 +170,39 @@ jobs:
                   }
               });
           }
-
-          rpc.exports = {
-              scandex: function() {
-                  var list = [];
-                  Process.enumerateRanges('r--').forEach(function(m) {
-                      try {
-                          var magic = m.base.readCString(4);
-                          if (magic === "dex\\n") {
-                              var size = m.base.add(0x20).readU32();
-                              if (size > 0x1000 && size < 0x3000000) {
-                                  list.push({ base: m.base.toString(), size: size });
-                              }
-                          }
-                      } catch(e) {}
-                  });
-                  return list;
-              },
-              dumpbytes: function(baseStr, size) {
-                  return ptr(baseStr).readByteArray(size);
-              }
-          };
           """
-
-          out_dir = os.path.expanduser("~/dumped_dex")
-          os.makedirs(out_dir, exist_ok=True)
-          seen_md5 = set()
-          dump_count = 0
-
-          def on_message(message, data):
-              global dump_count
-              if message.get('type') == 'send' and message.get('payload', {}).get('type') == 'dex_opened':
-                  if data:
-                      m = hashlib.md5(data).hexdigest()
-                      if m not in seen_md5:
-                          seen_md5.add(m)
-                          dump_count += 1
-                          fpath = os.path.join(out_dir, f"opencommon_{dump_count:02d}_{m[:8]}.dex")
-                          with open(fpath, "wb") as f:
-                              f.write(data)
-                          print(f"[🔥 INTERCEPTED DEX] Saved to {fpath} ({len(data)/1024/1024:.2f} MB)")
 
           script = session.create_script(js_code)
           script.on('message', on_message)
           script.load()
-          print("[*] Hook loaded. Resuming process...")
+          print("[*] Hook loaded in memory!")
 
-          # Resume the app so it proceeds into attachBaseContext and onCreate!
-          os.system("adb -s localhost:5555 shell am clear-debug-app")
+          # Resume process via JDWP handshake + VM.Resume packet
+          def resume_jdwp(port=8100):
+              try:
+                  s = socket.socket()
+                  s.connect(("localhost", port))
+                  s.sendall(b"JDWP-Handshake")
+                  resp = s.recv(14)
+                  if resp == b"JDWP-Handshake":
+                      print("[+] JDWP Handshake OK! Sending VM.Resume packet...")
+                      pkt = struct.pack(">IIBBB", 11, 1, 0, 1, 9)
+                      s.sendall(pkt)
+                      s.close()
+                      print("[+] App unpaused and running!")
+                      return True
+              except Exception as e:
+                  print("[-] JDWP error:", e)
+              return False
+
+          resume_jdwp(8100)
+          print("[*] Waiting 15s for DexProtector to decrypt assets.dat into RAM...")
           time.sleep(15)
 
+          # Sweep memory ranges
           try:
               ranges = script.exports_sync.scandex()
-              print(f"[*] Memory range scan found {len(ranges)} candidates")
+              print(f"[*] Memory range scan found {len(ranges)} DEX blocks in RAM")
               for item in ranges:
                   data = script.exports_sync.dumpbytes(item['base'], item['size'])
                   if data:
@@ -187,15 +210,15 @@ jobs:
                       if m not in seen_md5:
                           seen_md5.add(m)
                           dump_count += 1
-                          fpath = os.path.join(out_dir, f"scanned_{dump_count:02d}_{m[:8]}.dex")
+                          fpath = os.path.join(out_dir, f"memory_dump_{dump_count:02d}_{m[:8]}.dex")
                           with open(fpath, "wb") as f:
                               f.write(data)
-                          print(f"[+] Scanned DEX saved: {fpath} ({item['size']/1024/1024:.2f} MB)")
+                          print(f"[+] Dumped DEX: {fpath} ({item['size']/1024/1024:.2f} MB)")
           except Exception as e:
               print(f"[-] Scan exception: {e}")
 
           session.detach()
-          print(f"[✔] Total file DEX unik tersimpan: {len(seen_md5)}")
+          print(f"[✔] Total file DEX terdekripsi yang tersimpan: {len(seen_md5)}")
           EOF
 
           if [ -n "$PID" ]; then
