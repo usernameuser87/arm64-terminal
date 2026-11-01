@@ -87,7 +87,7 @@ jobs:
           echo "Forwarded JDWP port 8100 to PID $PID"
 
           cat << 'EOF' > /tmp/wait_dumper.py
-          import frida, time, os, sys, hashlib, subprocess, threading
+          import frida, time, os, sys, hashlib, subprocess
 
           pid = int(sys.argv[1])
           device = frida.get_usb_device()
@@ -98,17 +98,13 @@ jobs:
           os.makedirs(out_dir, exist_ok=True)
           seen_md5 = set()
           dump_count = 0
-          hook_ready = threading.Event()
 
           def on_message(message, data):
               global dump_count
               if message.get('type') == 'send':
                   payload = message.get('payload', {})
                   p_type = payload.get('type') if isinstance(payload, dict) else payload
-                  if p_type == 'hook_ready':
-                      print("[🔥] Java hook ready confirmation received from process!")
-                      hook_ready.set()
-                  elif p_type == 'dex_opened' and data:
+                  if p_type == 'dex_opened' and data:
                       m = hashlib.md5(data).hexdigest()
                       if m not in seen_md5:
                           seen_md5.add(m)
@@ -119,28 +115,37 @@ jobs:
                           print(f"[🔥 INTERCEPTED DEX] Saved: {fpath} ({len(data)/1024/1024:.2f} MB)")
 
           js_code = """
-          rpc.exports = {
-              scandex: function() {
-                  var list = [];
-                  Process.enumerateRanges('r--').forEach(function(m) {
-                      try {
-                          var magic = m.base.readCString(4);
-                          if (magic === "dex\\n") {
-                              var size = m.base.add(0x20).readU32();
-                              if (size > 0x1000 && size < 0x3000000) {
-                                  list.push({ base: m.base.toString(), size: size });
-                              }
-                          }
-                      } catch(e) {}
-                  });
-                  return list;
-              },
-              dumpbytes: function(baseStr, size) {
-                  return ptr(baseStr).readByteArray(size);
-              }
-          };
+          // Expected SHA-256 digest bytes for Indomaret: c3155378c113197a8a06963bb32ba7949cc9aa651b3cce4b23922de7fd05ffbf
+          var targetDigest = [195, 21, 83, 120, 193, 19, 25, 122, 138, 6, 150, 59, 179, 43, 167, 148, 156, 201, 170, 101, 27, 60, 206, 75, 35, 146, 45, 231, 253, 5, 255, 191];
 
-          // Hook libart DexFile::OpenCommon first
+          // 1. Native BoringSSL Hook: Intercept SHA256 function directly in C
+          Process.enumerateModules().forEach(function(m) {
+              if (m.name.indexOf("crypto") !== -1) {
+                  var pSHA256 = m.findExportByName("SHA256");
+                  if (pSHA256) {
+                      console.log("[+] Hooking native SHA256 in " + m.name);
+                      try {
+                          Interceptor.attach(pSHA256, {
+                              onEnter: function(args) {
+                                  this.len = args[1].toInt32();
+                                  this.out = args[2];
+                              },
+                              onLeave: function(retval) {
+                                  // Certificate length is around 600-1200 bytes
+                                  if (this.len > 500 && this.len < 1500) {
+                                      console.log("[🔥] Native BoringSSL SHA256 intercepted on certificate (len=" + this.len + ")! Overwriting with authentic digest...");
+                                      this.out.writeByteArray(targetDigest);
+                                  }
+                              }
+                          });
+                      } catch(e) {
+                          console.log("[-] Error hooking SHA256: " + e);
+                      }
+                  }
+              }
+          });
+
+          // 2. Native Art Hook: Intercept DexFile::OpenCommon to catch decrypted DEX bytes
           var artModule = Process.findModuleByName("libart.so");
           if (artModule) {
               artModule.enumerateExports().forEach(function(exp) {
@@ -164,35 +169,49 @@ jobs:
               });
           }
 
+          // 3. Java Hook (as backup once Java runtime becomes available)
           Java.perform(function() {
-              console.log("[*] In Java thread, installing ProtectedApp.b bypass...");
+              console.log("[*] Java runtime active!");
               try {
                   var ProtectedApp = Java.use("edts.klikidm.android.ProtectedApp");
                   ProtectedApp.b.implementation = function() {
-                      console.log("[🔥] BYPASSED ProtectedApp.b() Certificate Check successfully!");
+                      console.log("[🔥] Java ProtectedApp.b() bypassed!");
                       return;
                   };
-                  console.log("[+] Hook installed on ProtectedApp.b!");
-              } catch(e) {
-                  console.log("[-] Error hooking ProtectedApp.b: " + e);
-              }
-              send({ type: "hook_ready" });
+              } catch(e) {}
           });
+
+          rpc.exports = {
+              scandex: function() {
+                  var list = [];
+                  Process.enumerateRanges('r--').forEach(function(m) {
+                      try {
+                          var magic = m.base.readCString(4);
+                          if (magic === "dex\\n") {
+                              var size = m.base.add(0x20).readU32();
+                              if (size > 0x1000 && size < 0x3000000) {
+                                  list.push({ base: m.base.toString(), size: size });
+                              }
+                          }
+                      } catch(e) {}
+                  });
+                  return list;
+              },
+              dumpbytes: function(baseStr, size) {
+                  return ptr(baseStr).readByteArray(size);
+              }
+          };
           """
 
           script = session.create_script(js_code)
           script.on('message', on_message)
           script.load()
-
-          print("[*] Waiting for Java hook to be confirmed active...")
-          if hook_ready.wait(timeout=8):
-              print("[+] Hook confirmed! Now releasing JDWP debugger...")
-          else:
-              print("[!] Hook timeout warning, attempting resume anyway...")
+          print("[*] Native BoringSSL & Art hooks loaded!")
 
           # Resume process via jdb
+          print("[*] Resuming paused process via jdb...")
           subprocess.run(["jdb", "-attach", "localhost:8100"], input=b"exit\n", capture_output=True)
-          print("[+] JDB resume signal sent! App is executing.")
+          print("[+] JDB resume signal sent! Native hook is guarding execution.")
 
           print("[*] Waiting 15s for DexProtector to decrypt assets.dat into RAM...")
           time.sleep(15)
