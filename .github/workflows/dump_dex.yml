@@ -74,7 +74,7 @@ jobs:
           import frida, time, os, sys, hashlib
 
           device = frida.get_usb_device()
-          print("[*] Spawning com.indomaret.klikindomaret with stealth dumper...")
+          print("[*] Spawning com.indomaret.klikindomaret with JNI_OnLoad bypass...")
           pid = device.spawn(["com.indomaret.klikindomaret"])
           session = device.attach(pid)
 
@@ -96,7 +96,7 @@ jobs:
                       print(f"[🔥 INTERCEPTED DEX] Saved: {fpath} ({len(data)/1024/1024:.2f} MB)")
 
           js_code = """
-          // 1. Hook exit & abort to prevent process termination upon emulator check
+          // 1. Hook exit & abort to prevent process termination
           ['exit', '_exit', 'abort'].forEach(function(sym) {
               var p = Module.findExportByName("libc.so", sym);
               if (p) {
@@ -109,7 +109,33 @@ jobs:
               }
           });
 
-          // 2. Hook DexFile::OpenCommon to intercept decrypted DEX directly in memory
+          // 2. Hook JNI_OnLoad in libdexprotector.so to force JNI_VERSION_1_4 (0x10004)
+          var dlopenSym = Module.findExportByName(null, "android_dlopen_ext");
+          if (!dlopenSym) dlopenSym = Module.findExportByName(null, "dlopen");
+          if (dlopenSym) {
+              Interceptor.attach(dlopenSym, {
+                  onEnter: function(args) {
+                      this.path = args[0] ? args[0].readCString() : "";
+                  },
+                  onLeave: function(retval) {
+                      if (this.path && this.path.indexOf("dexprotector") !== -1) {
+                          console.log("[+] libdexprotector.so loaded! Hooking JNI_OnLoad...");
+                          var onLoad = Module.findExportByName("libdexprotector.so", "JNI_OnLoad");
+                          if (onLoad) {
+                              Interceptor.attach(onLoad, {
+                                  onLeave: function(r) {
+                                      console.log("[*] Original JNI_OnLoad returned: " + r.toInt32());
+                                      r.replace(ptr(0x00010004));
+                                      console.log("[🔥] Replaced JNI_OnLoad return value with JNI_VERSION_1_4 (0x10004)!");
+                                  }
+                              });
+                          }
+                      }
+                  }
+              });
+          }
+
+          // 3. Hook DexFile::OpenCommon to intercept decrypted DEX directly in memory
           var artModule = Process.findModuleByName("libart.so");
           if (artModule) {
               artModule.enumerateExports().forEach(function(exp) {
@@ -160,10 +186,10 @@ jobs:
           script.load()
 
           device.resume(pid)
-          print("[*] App resumed! Waiting 4s for initial decryption...")
-          time.sleep(4)
+          print("[*] App resumed! Waiting 15s for full initialization and decryption...")
+          time.sleep(15)
 
-          # Sweep memory ranges immediately while active
+          # Sweep memory ranges
           try:
               ranges = script.exports_sync.scandex()
               print(f"[*] Memory range scan found {len(ranges)} candidates")
