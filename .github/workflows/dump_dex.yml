@@ -11,7 +11,7 @@ jobs:
         run: |
           echo "=== 1. PREPARE KERNEL & PACKAGES ==="
           sudo modprobe binder_linux
-          sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils wget
+          sudo apt-get update && sudo apt-get install -y adb python3 wget
           
           echo "=== 2. RUN REDROID STANDARD ==="
           sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest
@@ -52,162 +52,108 @@ jobs:
           done
           adb -s localhost:5555 shell pm list packages | grep indomaret
 
-      - name: Setup Root Frida Server & Dump DEX
+      - name: Host Kernel RAM Dumper (Zero-Intrusion)
         run: |
           adb connect localhost:5555 || true
-
-          python3 -m venv ~/venv
-          ~/venv/bin/pip install frida frida-tools frida-dexdump
-
-          # Setup Frida Server di Android
-          curl -sL https://github.com/frida/frida/releases/download/17.25.0/frida-server-17.25.0-android-arm64.xz -o /tmp/frida.xz
-          xz -d -f /tmp/frida.xz
-          adb -s localhost:5555 push /tmp/frida /data/local/tmp/frida-server
-          adb -s localhost:5555 shell "chmod 755 /data/local/tmp/frida-server"
-          adb -s localhost:5555 shell "nohup /data/local/tmp/frida-server >/dev/null 2>&1 < /dev/null &"
-          sleep 4
-          ~/venv/bin/frida-ps -U | head -n 10
-
           mkdir -p ~/dumped_dex
 
-          cat << 'EOF' > /tmp/active_sweeper.py
-          import frida, time, os, sys, hashlib
+          cat << 'PYEOF' > /tmp/host_dumper.py
+          import sys, os, struct, time, hashlib, subprocess
 
           out_dir = os.path.expanduser("~/dumped_dex")
           os.makedirs(out_dir, exist_ok=True)
           seen_md5 = set()
           dump_count = 0
 
-          def save_dex(data, tag="scan"):
-              global dump_count
-              if data and len(data) > 0x1000:
-                  m = hashlib.md5(data).hexdigest()
-                  if m not in seen_md5:
-                      seen_md5.add(m)
-                      dump_count += 1
-                      fpath = os.path.join(out_dir, f"dex_{dump_count:02d}_{tag}_{m[:8]}.dex")
-                      with open(fpath, "wb") as f:
-                          f.write(data)
-                      print(f"[🔥 SUCCESS DUMP] {fpath} ({len(data)/1024/1024:.2f} MB)")
-
-          def on_message(message, data):
-              if message.get('type') == 'send':
-                  payload = message.get('payload', {})
-                  if isinstance(payload, dict) and payload.get('type') == 'dex_opened':
-                      save_dex(data, "art_open")
-                  elif isinstance(payload, str):
-                      print(f"[*] {payload}")
-
-          js_code = """
-          // 1. Intercept abort, exit, kill, tgkill to prevent instant death
-          ['exit', '_exit', 'abort', 'kill', 'tgkill'].forEach(function(sym) {
-              var p = Module.findExportByName("libc.so", sym);
-              if (p) {
-                  Interceptor.attach(p, {
-                      onEnter: function() {
-                          console.log("[🛡️] Intercepted " + sym + " - sleeping thread to keep memory alive!");
-                          Thread.sleep(60);
-                      }
-                  });
-              }
-          });
-
-          // 2. Intercept Java Uncaught Exception Handler
-          Java.perform(function() {
-              try {
-                  var ThreadClass = Java.use("java.lang.Thread");
-                  var Handler = Java.registerClass({
-                      name: "com.stealth.QuietHandler",
-                      implements: [Java.use("java.lang.Thread$UncaughtExceptionHandler")],
-                      methods: {
-                          uncaughtException: function(t, e) {
-                              console.log("[🛡️ CAUGHT JAVA FATAL] " + e);
-                          }
-                      }
-                  });
-                  ThreadClass.setDefaultUncaughtExceptionHandler(Handler.$new());
-              } catch(e) {
-                  console.log("Handler hook error: " + e);
-              }
-          });
-
-          // 3. Hook Art DexFile::OpenCommon
-          var artModule = Process.findModuleByName("libart.so");
-          if (artModule) {
-              artModule.enumerateExports().forEach(function(exp) {
-                  if (exp.name.indexOf("DexFile") !== -1 && exp.name.indexOf("OpenCommon") !== -1) {
-                      console.log("[+] Hooking Art OpenCommon: " + exp.name);
-                      try {
-                          Interceptor.attach(exp.address, {
-                              onEnter: function(args) {
-                                  var base = args[1];
-                                  var size = args[2].toInt32();
-                                  try {
-                                      var magic = base.readCString(4);
-                                      if (magic === "dex\\n") {
-                                          send({ type: "dex_opened" }, base.readByteArray(size));
-                                      }
-                                  } catch(e) {}
-                              }
-                          });
-                      } catch(e) {}
-                  }
-              });
-          }
-
-          rpc.exports = {
-              scandex: function() {
-                  var list = [];
-                  Process.enumerateRanges('r--').forEach(function(m) {
-                      try {
-                          var magic = m.base.readCString(4);
-                          if (magic === "dex\\n") {
-                              var size = m.base.add(0x20).readU32();
-                              if (size > 0x1000 && size < 0x3000000) {
-                                  list.push({ base: m.base.toString(), size: size });
-                              }
-                          }
-                      } catch(e) {}
-                  });
-                  return list;
-              },
-              dumpbytes: function(baseStr, size) {
-                  return ptr(baseStr).readByteArray(size);
-              }
-          };
-          """
-
-          device = frida.get_usb_device()
-          print("[*] Spawning com.indomaret.klikindomaret...")
-          pid = device.spawn(["com.indomaret.klikindomaret"])
-          session = device.attach(pid)
-          script = session.create_script(js_code)
-          script.on('message', on_message)
-          script.load()
-
-          print("[*] Resuming target process...")
-          device.resume(pid)
-
-          # Active sweep loop every 500ms for 16 seconds
-          for tick in range(32):
-              time.sleep(0.5)
+          def find_target_pid():
               try:
-                  ranges = script.exports_sync.scandex()
-                  if ranges:
-                      for item in ranges:
-                          data = script.exports_sync.dumpbytes(item['base'], item['size'])
-                          save_dex(data, f"tick_{tick:02d}")
-              except Exception as e:
+                  out = subprocess.check_output(["sudo", "docker", "top", "redroid"], text=True)
+                  for line in out.splitlines():
+                      if "com.indomaret.klikindomaret" in line:
+                          parts = line.split()
+                          return int(parts[1])
+              except:
                   pass
+              return None
 
-          print(f"[✔] Total file DEX tersimpan: {len(seen_md5)}")
-          session.detach()
-          EOF
+          print("[*] Launching app via adb...")
+          subprocess.run(["adb", "-s", "localhost:5555", "shell", "am", "start", "-n", "com.indomaret.klikindomaret/.ngsCexmFBytBw"])
 
-          ~/venv/bin/python /tmp/active_sweeper.py || true
-          adb -s localhost:5555 logcat -d | grep -iE 'indomaret|AndroidRuntime|ProtectedApp' | tail -n 35 || true
+          target_pid = None
+          for _ in range(80):
+              target_pid = find_target_pid()
+              if target_pid:
+                  break
+              time.sleep(0.05)
 
-          echo "=== DAFTAR FILE DUMPED DEX ==="
+          if not target_pid:
+              print("[-] Could not find host PID for target!")
+              sys.exit(0)
+
+          print(f"[🔥 TARGET DETECTED] Host PID: {target_pid}")
+          # Immediately pause the process with SIGSTOP from the host so it CANNOT exit or crash
+          subprocess.run(["sudo", "kill", "-STOP", str(target_pid)])
+          print(f"[❄️ FROZEN] Target host PID {target_pid} frozen in RAM via SIGSTOP!")
+
+          try:
+              with open(f"/proc/{target_pid}/maps", "r") as mf:
+                  maps = mf.readlines()
+          except Exception as e:
+              print(f"[-] Could not read maps: {e}")
+              maps = []
+
+          print(f"[*] Total memory mappings in target: {len(maps)}")
+
+          try:
+              mem = open(f"/proc/{target_pid}/mem", "rb", 0)
+          except Exception as e:
+              print(f"[-] Could not open /proc/{target_pid}/mem: {e}")
+              mem = None
+
+          if mem:
+              for line in maps:
+                  parts = line.split()
+                  if len(parts) < 2: continue
+                  addr_range = parts[0]
+                  perms = parts[1]
+                  if "r" in perms:
+                      start_hex, end_hex = addr_range.split("-")
+                      start = int(start_hex, 16)
+                      end = int(end_hex, 16)
+                      size = end - start
+                      if 0x1000 < size < 0x8000000:
+                          try:
+                              mem.seek(start)
+                              chunk = mem.read(size)
+                              pos = 0
+                              while True:
+                                  idx = chunk.find(b"dex\n", pos)
+                                  if idx == -1: break
+                                  if idx + 0x24 <= len(chunk):
+                                      dex_size = struct.unpack("<I", chunk[idx+0x20 : idx+0x24])[0]
+                                      if 0x1000 < dex_size <= (len(chunk) - idx + 0x1000):
+                                          dex_bytes = chunk[idx : idx + dex_size]
+                                          m = hashlib.md5(dex_bytes).hexdigest()
+                                          if m not in seen_md5:
+                                              seen_md5.add(m)
+                                              dump_count += 1
+                                              fpath = os.path.join(out_dir, f"memory_dex_{dump_count:02d}_{m[:8]}.dex")
+                                              with open(fpath, "wb") as out:
+                                                  out.write(dex_bytes)
+                                              print(f"[🔥 SUCCESS DUMP] {fpath} ({len(dex_bytes)/1024/1024:.2f} MB)")
+                                  pos = idx + 4
+                          except Exception as e:
+                              pass
+              mem.close()
+
+          # Resume process cleanly
+          subprocess.run(["sudo", "kill", "-CONT", str(target_pid)])
+          print(f"[✔] Total unique decrypted DEX files dumped: {len(seen_md5)}")
+          PYEOF
+
+          sudo python3 /tmp/host_dumper.py
+
+          echo "=== DAFTAR FILE DUMPED DEX DI HOST ==="
           ls -lh ~/dumped_dex/
 
       - name: Upload Dumped DEX to Artifacts
