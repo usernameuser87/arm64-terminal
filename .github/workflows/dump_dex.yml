@@ -75,8 +75,9 @@ jobs:
           adb connect localhost:5555 || true
           mkdir -p $GITHUB_WORKSPACE/results
 
-          # Push target strings list
+          # Push target strings list into Android container
           adb -s localhost:5555 push all_enc_strings.txt /data/local/tmp/all_enc_strings.txt
+          adb -s localhost:5555 shell "chmod 777 /data/local/tmp/all_enc_strings.txt"
 
           cat << 'PYEOF' > /tmp/runner_decrypt.py
           import frida, time, sys, os
@@ -87,43 +88,51 @@ jobs:
           session = device.attach(pid)
 
           js_code = """
-          // 1. Prevent abort/exit from interrupting string batch decryption
-          ['exit', '_exit', 'abort'].forEach(function(sym) {
-              var p = Module.findExportByName("libc.so", sym);
-              if (p) {
-                  Interceptor.attach(p, {
-                      onEnter: function() {
-                          console.log("[🛡️] Prevented " + sym + " from aborting!");
-                          Thread.sleep(60);
-                      }
-                  });
-              }
-          });
+          Java.perform(function() {
+              console.log("[*] Injected into process! Waiting for ProtectedApp.c()...");
 
-          rpc.exports = {
-              decryptbatch: function(encList) {
-                  var results = {};
-                  Java.perform(function() {
-                      try {
-                          var ProtectedApp = Java.use("edts.klikidm.android.ProtectedApp");
-                          for (var i = 0; i < encList.length; i++) {
-                              var pair = encList[i];
-                              var name = pair[0];
-                              var enc = pair[1];
+              var ProtectedApp = Java.use("edts.klikidm.android.ProtectedApp");
+              ProtectedApp.c.implementation = function() {
+                  console.log("[*] ProtectedApp.c() executing original init...");
+                  var ret = this.c();
+                  console.log("[🔥] ProtectedApp.c() completed! DexProtector is ready. Starting string harvesting...");
+
+                  try {
+                      var BufferedReader = Java.use("java.io.BufferedReader");
+                      var FileReader = Java.use("java.io.FileReader");
+                      var BufferedWriter = Java.use("java.io.BufferedWriter");
+                      var FileWriter = Java.use("java.io.FileWriter");
+
+                      var reader = BufferedReader.$new(FileReader.$new("/data/local/tmp/all_enc_strings.txt"));
+                      var writer = BufferedWriter.$new(FileWriter.$new("/data/local/tmp/all_decrypted_strings.txt"));
+
+                      var line = null;
+                      var count = 0;
+                      while ((line = reader.readLine()) !== null) {
+                          var parts = line.split("|");
+                          if (parts.length >= 2) {
+                              var name = parts[0];
+                              var enc = parts[1];
                               try {
                                   var plain = ProtectedApp.s(enc);
-                                  results[name] = plain;
+                                  writer.write(name + "=" + plain + "\\n");
+                                  count++;
                               } catch(e) {
-                                  results[name] = "[ERR: " + e + "]";
+                                  writer.write(name + "=[ERR: " + e + "]\\n");
                               }
                           }
-                      } catch(err) {
-                          console.log("Java.perform error: " + err);
                       }
-                  });
-                  return results;
-              }
-          };
+                      reader.close();
+                      writer.flush();
+                      writer.close();
+                      console.log("[✔✔✔] HARVESTED ALL " + count + " DECRYPTED STRINGS DIRECTLY IN RAM!");
+                  } catch(err) {
+                      console.log("[-] Harvester error: " + err);
+                  }
+
+                  return ret;
+              };
+          });
           """
 
           script = session.create_script(js_code)
@@ -131,41 +140,19 @@ jobs:
 
           print("[*] Resuming app to let DexProtector initialize...")
           device.resume(pid)
-          time.sleep(3)
 
-          # Read all 2903 strings
-          with open("all_enc_strings.txt", "r") as f:
-              lines = [l.strip().split("|", 1) for l in f if "|" in l]
+          # Wait 10s for harvester to finish
+          for _ in range(20):
+              time.sleep(0.5)
 
-          print(f"[*] Loaded {len(lines)} encrypted strings. Starting batch decryption...")
-
-          out_file = os.path.expanduser("~/results/all_decrypted_strings.txt")
-          os.makedirs(os.path.dirname(out_file), exist_ok=True)
-
-          # Process in chunks of 100
-          chunk_size = 100
-          decrypted_total = 0
-
-          with open(out_file, "w", encoding="utf-8") as out:
-              for i in range(0, len(lines), chunk_size):
-                  chunk = lines[i:i+chunk_size]
-                  try:
-                      res = script.exports_sync.decryptbatch(chunk)
-                      for name, plain in res.items():
-                          out.write(f"{name}={plain}\n")
-                          decrypted_total += 1
-                      print(f"[+] Decrypted chunk {i//chunk_size + 1}/{(len(lines)+chunk_size-1)//chunk_size} ({decrypted_total}/{len(lines)})")
-                  except Exception as e:
-                      print(f"[-] Chunk error: {e}")
-
-          print(f"[✔] Batch decryption complete! Saved {decrypted_total} decrypted strings to {out_file}")
           session.detach()
           PYEOF
 
           cp /tmp/runner_decrypt.py $GITHUB_WORKSPACE/runner_decrypt.py
           ~/venv/bin/python /tmp/runner_decrypt.py || true
 
-          cp ~/results/all_decrypted_strings.txt $GITHUB_WORKSPACE/results/ || true
+          # Pull decrypted strings from container
+          adb -s localhost:5555 pull /data/local/tmp/all_decrypted_strings.txt $GITHUB_WORKSPACE/results/ || true
 
           echo "=== PREVIEW DECRYPTED STRINGS ==="
           head -n 40 $GITHUB_WORKSPACE/results/all_decrypted_strings.txt || true
