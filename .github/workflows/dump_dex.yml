@@ -13,18 +13,8 @@ jobs:
           sudo modprobe binder_linux
           sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils wget
           
-          echo "=== 2. RUN REDROID WITH SPOOFED PROPS ==="
-          sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest \
-            ro.product.model=SM-G998B \
-            ro.product.brand=samsung \
-            ro.product.manufacturer=samsung \
-            ro.product.device=p3s \
-            ro.build.flavor=p3sxxx-user \
-            ro.build.type=user \
-            ro.build.tags=release-keys \
-            ro.hardware=exynos2100 \
-            androidboot.hardware=exynos2100 \
-            qemu=0
+          echo "=== 2. RUN REDROID STANDARD ==="
+          sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest
           
           echo "=== 3. WAIT FOR ANDROID BOOT COMPLETED ==="
           for i in {1..40}; do
