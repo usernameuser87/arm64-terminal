@@ -11,7 +11,7 @@ jobs:
         run: |
           echo "=== 1. PREPARE KERNEL & PACKAGES ==="
           sudo modprobe binder_linux
-          sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils wget
+          sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils wget openjdk-17-jdk-headless
           
           echo "=== 2. RUN REDROID ANDROID 11 ==="
           sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest
@@ -87,7 +87,7 @@ jobs:
           echo "Forwarded JDWP port 8100 to PID $PID"
 
           cat << 'EOF' > /tmp/wait_dumper.py
-          import frida, time, os, sys, hashlib, socket, struct
+          import frida, time, os, sys, hashlib, subprocess
 
           pid = int(sys.argv[1])
           device = frida.get_usb_device()
@@ -177,25 +177,11 @@ jobs:
           script.load()
           print("[*] Hook loaded in memory!")
 
-          # Resume process via JDWP handshake + VM.Resume packet
-          def resume_jdwp(port=8100):
-              try:
-                  s = socket.socket()
-                  s.connect(("localhost", port))
-                  s.sendall(b"JDWP-Handshake")
-                  resp = s.recv(14)
-                  if resp == b"JDWP-Handshake":
-                      print("[+] JDWP Handshake OK! Sending VM.Resume packet...")
-                      pkt = struct.pack(">IIBBB", 11, 1, 0, 1, 9)
-                      s.sendall(pkt)
-                      s.close()
-                      print("[+] App unpaused and running!")
-                      return True
-              except Exception as e:
-                  print("[-] JDWP error:", e)
-              return False
+          # Resume process using jdb attach command
+          print("[*] Resuming paused process via jdb...")
+          subprocess.run(["jdb", "-attach", "localhost:8100"], input=b"exit\n", capture_output=True)
+          print("[+] JDB resume signal sent!")
 
-          resume_jdwp(8100)
           print("[*] Waiting 15s for DexProtector to decrypt assets.dat into RAM...")
           time.sleep(15)
 
