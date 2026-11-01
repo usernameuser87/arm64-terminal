@@ -11,7 +11,7 @@ jobs:
         run: |
           echo "=== 1. PREPARE KERNEL & PACKAGES ==="
           sudo modprobe binder_linux
-          sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils wget openjdk-17-jdk-headless
+          sudo apt-get update && sudo apt-get install -y adb python3-pip python3-venv xz-utils wget
           
           echo "=== 2. RUN REDROID ANDROID 11 ==="
           sudo docker run -itd --privileged -p 5555:5555 --name redroid redroid/redroid:11.0.0-latest
@@ -88,7 +88,7 @@ jobs:
           echo "Forwarded JDWP port 8100 to PID $PID"
 
           cat << 'EOF' > /tmp/wait_dumper.py
-          import frida, time, os, sys, hashlib, subprocess
+          import frida, time, os, sys, hashlib, socket, struct, threading
 
           pid = int(sys.argv[1])
           device = frida.get_usb_device()
@@ -203,13 +203,28 @@ jobs:
           script.load()
           print("[*] Native BoringSSL EVP & Art hooks loaded!")
 
-          # Resume process via jdb
-          print("[*] Resuming paused process via jdb...")
-          subprocess.run(["jdb", "-attach", "localhost:8100"], input=b"exit\n", capture_output=True)
-          print("[+] JDB resume signal sent! Native hook is guarding execution.")
+          # Resume process via Python JDWP daemon thread
+          def jdwp_resumer():
+              try:
+                  s = socket.socket()
+                  s.connect(("localhost", 8100))
+                  s.sendall(b"JDWP-Handshake")
+                  resp = s.recv(14)
+                  if resp == b"JDWP-Handshake":
+                      print("[+] JDWP Handshake OK! Sending VM.Resume packet...")
+                      pkt = struct.pack(">IIBBB", 11, 1, 0, 1, 9)
+                      s.sendall(pkt)
+                      print("[+] JDWP Resume sent! Holding connection open for execution...")
+                      time.sleep(25)
+                      s.close()
+              except Exception as e:
+                  print("[-] JDWP error:", e)
 
-          print("[*] Waiting 15s for DexProtector to decrypt assets.dat into RAM...")
-          time.sleep(15)
+          jdwp_thread = threading.Thread(target=jdwp_resumer, daemon=True)
+          jdwp_thread.start()
+
+          print("[*] Waiting 20s for DexProtector to decrypt assets.dat into RAM...")
+          time.sleep(20)
 
           # Sweep memory ranges
           try:
