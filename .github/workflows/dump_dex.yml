@@ -119,30 +119,36 @@ jobs:
           // Expected SHA-256 digest bytes for Indomaret: c3155378c113197a8a06963bb32ba7949cc9aa651b3cce4b23922de7fd05ffbf
           var targetDigest = [195, 21, 83, 120, 193, 19, 25, 122, 138, 6, 150, 59, 179, 43, 167, 148, 156, 201, 170, 101, 27, 60, 206, 75, 35, 146, 45, 231, 253, 5, 255, 191];
 
-          // 1. Native BoringSSL Hook: Intercept SHA256 function directly in C
+          // 1. Native BoringSSL Hook: Intercept EVP_DigestFinal_ex & EVP_DigestFinal directly in C
           Process.enumerateModules().forEach(function(m) {
-              if (m.name.indexOf("crypto") !== -1) {
-                  var pSHA256 = m.findExportByName("SHA256");
-                  if (pSHA256) {
-                      console.log("[+] Hooking native SHA256 in " + m.name);
-                      try {
-                          Interceptor.attach(pSHA256, {
-                              onEnter: function(args) {
-                                  this.len = args[1].toInt32();
-                                  this.out = args[2];
-                              },
-                              onLeave: function(retval) {
-                                  // Certificate length is around 600-1200 bytes
-                                  if (this.len > 500 && this.len < 1500) {
-                                      console.log("[🔥] Native BoringSSL SHA256 intercepted on certificate (len=" + this.len + ")! Overwriting with authentic digest...");
-                                      this.out.writeByteArray(targetDigest);
+              if (m.name.indexOf("crypto") !== -1 || m.name.indexOf("ssl") !== -1) {
+                  ["EVP_DigestFinal_ex", "EVP_DigestFinal", "SHA256_Final", "SHA256"].forEach(function(sym) {
+                      var exp = m.findExportByName(sym);
+                      if (exp) {
+                          console.log("[+] Intercepting native " + sym + " in " + m.name);
+                          try {
+                              Interceptor.attach(exp, {
+                                  onEnter: function(args) {
+                                      if (sym === "EVP_DigestFinal_ex" || sym === "EVP_DigestFinal") {
+                                          this.out = args[1];
+                                      } else if (sym === "SHA256_Final") {
+                                          this.out = args[0];
+                                      } else if (sym === "SHA256") {
+                                          this.out = args[2];
+                                      }
+                                  },
+                                  onLeave: function(retval) {
+                                      if (this.out) {
+                                          try {
+                                              this.out.writeByteArray(targetDigest);
+                                              console.log("[🔥] Spoofed authentic SHA256 digest via " + sym + "!");
+                                          } catch(e) {}
+                                      }
                                   }
-                              }
-                          });
-                      } catch(e) {
-                          console.log("[-] Error hooking SHA256: " + e);
+                              });
+                          } catch(e) {}
                       }
-                  }
+                  });
               }
           });
 
@@ -170,18 +176,6 @@ jobs:
               });
           }
 
-          // 3. Java Hook (as backup once Java runtime becomes available)
-          Java.perform(function() {
-              console.log("[*] Java runtime active!");
-              try {
-                  var ProtectedApp = Java.use("edts.klikidm.android.ProtectedApp");
-                  ProtectedApp.b.implementation = function() {
-                      console.log("[🔥] Java ProtectedApp.b() bypassed!");
-                      return;
-                  };
-              } catch(e) {}
-          });
-
           rpc.exports = {
               scandex: function() {
                   var list = [];
@@ -207,7 +201,7 @@ jobs:
           script = session.create_script(js_code)
           script.on('message', on_message)
           script.load()
-          print("[*] Native BoringSSL & Art hooks loaded!")
+          print("[*] Native BoringSSL EVP & Art hooks loaded!")
 
           # Resume process via jdb
           print("[*] Resuming paused process via jdb...")
